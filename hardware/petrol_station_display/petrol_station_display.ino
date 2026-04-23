@@ -32,7 +32,7 @@ using fs::FS;  // ESP32 core v3.x needs this before <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
-#include <qrcode.h>   // ricmoo/QRCode — install via Arduino Library Manager
+#include <qrcode.h>   // ESP-IDF built-in QR encoder (ships with the ESP32 core)
 #include <time.h>
 
 #include "logos.h"
@@ -60,7 +60,7 @@ struct CheapestStation {
 // =============================================================
 // CONFIG
 // =============================================================
-const char* PORTAL_SSID = "PetrolStation-Setup";
+const char* PORTAL_SSID = "MiniForecourt";
 const char* PROXY_URL_DEFAULT = "http://144.21.57.147:8080";
 
 const char* NTP_SERVER = "time.google.com";
@@ -320,6 +320,36 @@ int drawNameWrapped(const String& text, int cx, int centerY, int maxW) {
   return 2;
 }
 
+// ESP-IDF's qrcode API is callback-based, so stash drawing context in a
+// module-scope struct that the callback reads.
+struct QRDrawCtx {
+  int blockX, blockY;
+  int modulePx, marginPx;
+  int blockPx;  // filled in by the callback
+};
+static QRDrawCtx g_qr{0, 0, 2, 3, 0};
+
+static void qrDrawCallback(esp_qrcode_handle_t qrcode) {
+  int sz = esp_qrcode_get_size(qrcode);
+  int codePx = sz * g_qr.modulePx;
+  int blockPx = codePx + 2 * g_qr.marginPx;
+
+  // 0xFFFF/0x0000 are the same byte pattern under either RGB or BGR ordering,
+  // so the QR renders cleanly regardless of the panel's colour-order wiring.
+  tft.fillRect(g_qr.blockX, g_qr.blockY, blockPx, blockPx, 0xFFFF);
+
+  for (int y = 0; y < sz; y++) {
+    for (int x = 0; x < sz; x++) {
+      if (esp_qrcode_get_module(qrcode, x, y)) {
+        tft.fillRect(g_qr.blockX + g_qr.marginPx + x * g_qr.modulePx,
+                     g_qr.blockY + g_qr.marginPx + y * g_qr.modulePx,
+                     g_qr.modulePx, g_qr.modulePx, 0x0000);
+      }
+    }
+  }
+  g_qr.blockPx = blockPx;
+}
+
 // Draw a scannable QR encoding the Google Maps directions URL for (lat, lon)
 // at the given top-left pixel. Returns the pixel width of the QR block
 // (including its quiet-zone border) so the caller can lay out text beside it.
@@ -331,30 +361,19 @@ int drawDirectionsQRAt(double lat, double lon, int blockX, int blockY) {
            "https://www.google.com/maps/dir/?api=1&destination=%.5f,%.5f",
            lat, lon);
 
-  constexpr uint8_t QR_VERSION = 5;  // 37x37 modules; 106 alnum chars @ ECC_L
-  uint8_t buf[qrcode_getBufferSize(QR_VERSION)];
-  QRCode qr;
-  if (qrcode_initText(&qr, buf, QR_VERSION, ECC_LOW, url) != 0) return 0;
+  g_qr.blockX = blockX;
+  g_qr.blockY = blockY;
+  g_qr.modulePx = 2;
+  g_qr.marginPx = 3;
+  g_qr.blockPx = 0;
 
-  constexpr int MODULE_PX = 2;
-  constexpr int MARGIN_PX = 3;  // white quiet zone
-  int codePx = qr.size * MODULE_PX;
-  int blockPx = codePx + 2 * MARGIN_PX;
+  esp_qrcode_config_t cfg;
+  cfg.max_qrcode_version = 10;       // auto-picks smallest needed version up to 10
+  cfg.qrcode_ecc_level = ESP_QRCODE_ECC_LOW;
+  cfg.display_func = qrDrawCallback;
 
-  // 0xFFFF/0x0000 are the same byte pattern under either RGB or BGR ordering,
-  // so the QR renders cleanly regardless of the panel's colour-order wiring.
-  tft.fillRect(blockX, blockY, blockPx, blockPx, 0xFFFF);
-
-  for (uint8_t y = 0; y < qr.size; y++) {
-    for (uint8_t x = 0; x < qr.size; x++) {
-      if (qrcode_getModule(&qr, x, y)) {
-        tft.fillRect(blockX + MARGIN_PX + x * MODULE_PX,
-                     blockY + MARGIN_PX + y * MODULE_PX,
-                     MODULE_PX, MODULE_PX, 0x0000);
-      }
-    }
-  }
-  return blockPx;
+  if (esp_qrcode_generate(&cfg, url) != 0) return 0;
+  return g_qr.blockPx;
 }
 
 // Left-aligned station name, wrapped onto a second line on the last space
@@ -525,7 +544,7 @@ String buildConfigPage(const String& message = "") {
   String savedWifi = savedSSID();
 
   String html = F("<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
-                  "<title>Fuel Display Setup</title>"
+                  "<title>MiniForecourt</title>"
                   "<style>"
                   "body{font-family:-apple-system,system-ui,sans-serif;background:#101820;color:#fff;margin:0;padding:20px;}"
                   "h1{color:#fb8020;margin-top:0;}"
@@ -536,7 +555,7 @@ String buildConfigPage(const String& message = "") {
                   ".msg{background:#442200;padding:10px;border-radius:4px;margin-bottom:10px;}"
                   ".hint{font-size:12px;color:#888;margin-top:4px;}"
                   "</style></head><body>"
-                  "<h1>Fuel Display Setup</h1>");
+                  "<h1>MiniForecourt Setup</h1>");
   if (message.length()) {
     html += "<div class=msg>" + htmlEscape(message) + "</div>";
   }
