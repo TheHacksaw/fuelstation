@@ -4,17 +4,21 @@ Convert PNG brand logos into an RGB565 C header for the ESP32 sketch.
 
 Usage:
     pip install Pillow
-    python3 convert_logos.py              # default 64x64
-    python3 convert_logos.py --size 48
+    python3 convert_logos.py                 # default max 128x64
+    python3 convert_logos.py --max-w 100 --max-h 72
 
 Place PNGs (transparent or solid background) in ../logos/ named after the
 canonical brand slug — e.g. shell.png, bp.png, esso.png. Slugs must match
-the ones the proxy emits in /cheapest → brand_slug. Run /brands on the
-proxy to see which slugs cover the most stations.
+the ones the proxy emits in /cheapest → brand_slug.
+
+Aspect ratio is preserved: each logo is downsized to fit within the given
+max-width × max-height box without distortion. The actual rendered size
+per logo is emitted in the header so the sketch can position it correctly.
 
 The script writes ../petrol_station_display/logos.h containing:
     - one PROGMEM uint16_t[] per logo, RGB565
-    - a BRAND_LOGOS table and lookupBrandLogo(slug) helper
+    - a BRAND_LOGOS table mapping slug → {data, width, height}
+    - lookupBrandLogo(slug) helper
 
 The sketch #includes this file.
 """
@@ -30,8 +34,8 @@ except ImportError:
     sys.exit("Install Pillow first: pip install Pillow")
 
 # TFT background colour in RGB565 is 0x10A2 → RGB(16, 20, 16). Any transparent
-# pixels in the source PNG are flattened onto this so the logo blends
-# seamlessly with the screen background.
+# pixels in the source PNG are flattened onto this so the logo blends with
+# the screen background.
 TFT_BG_RGB = (16, 20, 16)
 
 
@@ -39,7 +43,7 @@ def rgb565(r: int, g: int, b: int) -> int:
     return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
 
 
-def convert_image(path: Path, size: int) -> list[int]:
+def convert_image(path: Path, max_w: int, max_h: int) -> tuple[list[int], int, int]:
     img = Image.open(path).convert("RGBA")
     bg = Image.new("RGBA", img.size, TFT_BG_RGB + (255,))
     flat = Image.alpha_composite(bg, img).convert("RGB")
@@ -47,8 +51,9 @@ def convert_image(path: Path, size: int) -> list[int]:
         resample = Image.Resampling.LANCZOS
     except AttributeError:
         resample = Image.LANCZOS
-    flat = flat.resize((size, size), resample)
-    return [rgb565(r, g, b) for (r, g, b) in flat.getdata()]
+    flat.thumbnail((max_w, max_h), resample)
+    w, h = flat.size
+    return [rgb565(r, g, b) for (r, g, b) in flat.getdata()], w, h
 
 
 def emit_array(name: str, data: list[int]) -> str:
@@ -63,7 +68,8 @@ def emit_array(name: str, data: list[int]) -> str:
 def main() -> None:
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--size", type=int, default=64, help="Output square size in pixels (default 64)")
+    parser.add_argument("--max-w", type=int, default=128, help="Max width in pixels (default 128)")
+    parser.add_argument("--max-h", type=int, default=64, help="Max height in pixels (default 64)")
     parser.add_argument("--logos-dir", type=Path, default=here.parent / "logos")
     parser.add_argument("--output", type=Path,
                         default=here.parent / "petrol_station_display" / "logos.h")
@@ -83,33 +89,36 @@ def main() -> None:
         "#pragma once",
         "#include <Arduino.h>",
         "",
-        f"constexpr int BRAND_LOGO_SIZE = {args.size};",
+        "struct BrandLogo {",
+        "  const char* slug;",
+        "  const uint16_t* data;",
+        "  uint16_t width;",
+        "  uint16_t height;",
+        "};",
         "",
     ]
 
-    slugs: list[str] = []
+    slugs: list[tuple[str, int, int]] = []
     for png in pngs:
         slug = png.stem.lower().replace("-", "_")
-        slugs.append(slug)
-        print(f"  {png.name:30s} -> {slug} ({args.size}x{args.size})", file=sys.stderr)
-        header.append(emit_array(f"LOGO_{slug}", convert_image(png, args.size)))
+        data, w, h = convert_image(png, args.max_w, args.max_h)
+        slugs.append((slug, w, h))
+        print(f"  {png.name:30s} -> {slug:20s} {w}x{h}", file=sys.stderr)
+        header.append(f"// {png.name} -> {w}x{h}")
+        header.append(emit_array(f"LOGO_{slug}", data))
         header.append("")
 
-    header.extend([
-        "struct BrandLogo { const char* slug; const uint16_t* data; };",
-        "",
-        "constexpr BrandLogo BRAND_LOGOS[] = {",
-    ])
-    for slug in slugs:
-        header.append(f'  {{"{slug}", LOGO_{slug}}},')
+    header.append("constexpr BrandLogo BRAND_LOGOS[] = {")
+    for slug, w, h in slugs:
+        header.append(f'  {{"{slug}", LOGO_{slug}, {w}, {h}}},')
     header.extend([
         "};",
         "constexpr size_t BRAND_LOGO_COUNT = sizeof(BRAND_LOGOS) / sizeof(BRAND_LOGOS[0]);",
         "",
-        "inline const uint16_t* lookupBrandLogo(const String& slug) {",
+        "inline const BrandLogo* lookupBrandLogo(const String& slug) {",
         "  if (slug.length() == 0) return nullptr;",
         "  for (size_t i = 0; i < BRAND_LOGO_COUNT; i++) {",
-        "    if (slug == BRAND_LOGOS[i].slug) return BRAND_LOGOS[i].data;",
+        "    if (slug == BRAND_LOGOS[i].slug) return &BRAND_LOGOS[i];",
         "  }",
         "  return nullptr;",
         "}",

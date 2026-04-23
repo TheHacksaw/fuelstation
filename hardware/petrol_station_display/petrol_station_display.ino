@@ -319,11 +319,16 @@ void drawHero() {
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
 
-  const uint16_t* logo = lookupBrandLogo(displayedBrandSlug);
+  const BrandLogo* logo = lookupBrandLogo(displayedBrandSlug);
   if (logo != nullptr) {
-    int lx = cx - BRAND_LOGO_SIZE / 2;
-    int ly = 45 - BRAND_LOGO_SIZE / 2;
-    tft.pushImage(lx, ly, BRAND_LOGO_SIZE, BRAND_LOGO_SIZE, logo);
+    int lx = cx - logo->width / 2;
+    int ly = 45 - logo->height / 2;
+    // Converter writes RGB565 values MSB-first in each uint16_t. The ESP32 is
+    // little-endian, so without this toggle the display reads each pixel's
+    // bytes in the wrong order and colour channels end up swapped around.
+    tft.setSwapBytes(true);
+    tft.pushImage(lx, ly, logo->width, logo->height, logo->data);
+    tft.setSwapBytes(false);
   } else {
     drawLogo(cx, 45, 55, COL_LOGO);
   }
