@@ -146,6 +146,21 @@ private:
 
   uint8_t encodeDigit(uint8_t d) { return (d < 10) ? DIGIT_PATTERNS[d] : BLANK_PATTERN; }
 
+  // Hand-rolled shift with explicit edge delays. Arduino's shiftOut on the
+  // ESP32 can toggle fast enough that long jumper wires ring into spurious
+  // SCLK edges, jumbling bits in the chain. Adding small waits lets each
+  // edge settle before the next one fires.
+  static inline void shiftByte(uint8_t val) {
+    for (int i = 7; i >= 0; i--) {
+      digitalWrite(PIN_SEG_SDI, (val >> i) & 1);
+      delayMicroseconds(3);
+      digitalWrite(PIN_SEG_SCLK, HIGH);
+      delayMicroseconds(3);
+      digitalWrite(PIN_SEG_SCLK, LOW);
+      delayMicroseconds(1);
+    }
+  }
+
   void buildModulePatterns(int value, bool valid, uint8_t out[3]) {
     if (!valid) { out[0]=out[1]=out[2]=BLANK_PATTERN; return; }
     uint8_t d2 = value % 10;
@@ -180,11 +195,13 @@ private:
 
     digitalWrite(PIN_SEG_LOAD, LOW);
     if (REVERSE_DIGIT_SHIFT_ORDER) {
-      for (int i=0; i<6; i++) shiftOut(PIN_SEG_SDI, PIN_SEG_SCLK, MSBFIRST, out[i]);
+      for (int i=0; i<6; i++) shiftByte(out[i]);
     } else {
-      for (int i=5; i>=0; i--) shiftOut(PIN_SEG_SDI, PIN_SEG_SCLK, MSBFIRST, out[i]);
+      for (int i=5; i>=0; i--) shiftByte(out[i]);
     }
+    delayMicroseconds(2);
     digitalWrite(PIN_SEG_LOAD, HIGH);
+    delayMicroseconds(5);
     digitalWrite(PIN_SEG_LOAD, LOW);
   }
 };
