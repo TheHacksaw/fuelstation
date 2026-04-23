@@ -320,11 +320,10 @@ int drawNameWrapped(const String& text, int cx, int centerY, int maxW) {
   return 2;
 }
 
-// Draw a scannable QR for the Google Maps directions URL at the given coords.
-// Sits in the top-right corner so it doesn't fight with the logo. Returns the
-// pixel width of the QR block (including its white border) so drawHero can
-// narrow the logo's available real estate.
-int drawDirectionsQR(double lat, double lon) {
+// Draw a scannable QR encoding the Google Maps directions URL for (lat, lon)
+// at the given top-left pixel. Returns the pixel width of the QR block
+// (including its quiet-zone border) so the caller can lay out text beside it.
+int drawDirectionsQRAt(double lat, double lon, int blockX, int blockY) {
   if (lat == 0.0 && lon == 0.0) return 0;
 
   char url[96];
@@ -338,14 +337,12 @@ int drawDirectionsQR(double lat, double lon) {
   if (qrcode_initText(&qr, buf, QR_VERSION, ECC_LOW, url) != 0) return 0;
 
   constexpr int MODULE_PX = 2;
-  constexpr int MARGIN_PX = 3;  // white quiet zone around the code
+  constexpr int MARGIN_PX = 3;  // white quiet zone
   int codePx = qr.size * MODULE_PX;
   int blockPx = codePx + 2 * MARGIN_PX;
-  int blockX = SCREEN_W - blockPx - 6;
-  int blockY = 4;
 
-  // White background (quiet zone). 0xFFFF is all-bits-on so it's white
-  // regardless of the panel's RGB/BGR ordering.
+  // 0xFFFF/0x0000 are the same byte pattern under either RGB or BGR ordering,
+  // so the QR renders cleanly regardless of the panel's colour-order wiring.
   tft.fillRect(blockX, blockY, blockPx, blockPx, 0xFFFF);
 
   for (uint8_t y = 0; y < qr.size; y++) {
@@ -360,43 +357,94 @@ int drawDirectionsQR(double lat, double lon) {
   return blockPx;
 }
 
+// Left-aligned station name, wrapped onto a second line on the last space
+// that still fits line 1. Caller is expected to have set the text colour;
+// this also sets the datum. Returns the line count (1 or 2).
+int drawNameLeftWrapped(const String& text, int x, int topY, int maxW) {
+  tft.setTextDatum(TL_DATUM);
+  if (tft.textWidth(text.c_str(), 4) <= maxW) {
+    tft.drawString(text.c_str(), x, topY, 4);
+    return 1;
+  }
+
+  int splitIdx = -1;
+  for (int i = (int)text.length() - 1; i > 0; i--) {
+    if (text.charAt(i) == ' ') {
+      String first = text.substring(0, i);
+      if (tft.textWidth(first.c_str(), 4) <= maxW) {
+        splitIdx = i;
+        break;
+      }
+    }
+  }
+
+  if (splitIdx < 0) {
+    String trimmed = text;
+    while (tft.textWidth((trimmed + "...").c_str(), 4) > maxW && trimmed.length() > 4) {
+      trimmed.remove(trimmed.length() - 1);
+    }
+    trimmed += "...";
+    tft.drawString(trimmed.c_str(), x, topY, 4);
+    return 1;
+  }
+
+  String line1 = text.substring(0, splitIdx);
+  String line2 = text.substring(splitIdx + 1);
+  if (tft.textWidth(line2.c_str(), 4) > maxW) {
+    while (tft.textWidth((line2 + "...").c_str(), 4) > maxW && line2.length() > 4) {
+      line2.remove(line2.length() - 1);
+    }
+    line2 += "...";
+  }
+  tft.drawString(line1.c_str(), x, topY, 4);
+  tft.drawString(line2.c_str(), x, topY + 30, 4);
+  return 2;
+}
+
 void drawHero() {
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
 
-  // QR first so the logo can be placed in whatever horizontal space is left.
-  int qrWidth = drawDirectionsQR(displayedLat, displayedLon);
-  int logoCx = qrWidth > 0 ? (SCREEN_W - qrWidth - 12) / 2 : cx;
-
+  // Logo across the top, centered.
   const BrandLogo* logo = lookupBrandLogo(displayedBrandSlug);
+  int logoBottomY;
   if (logo != nullptr) {
-    int lx = logoCx - logo->width / 2;
-    int ly = 45 - logo->height / 2;
-    // Converter writes RGB565 values MSB-first in each uint16_t. The ESP32 is
-    // little-endian, so without this toggle the display reads each pixel's
-    // bytes in the wrong order and colour channels end up swapped around.
+    int lx = cx - logo->width / 2;
+    int ly = 6;
+    // Converter writes RGB565 MSB-first in each uint16_t; ESP32 is little-
+    // endian, so without this toggle the panel reads each pixel's bytes
+    // reversed and colours come out wrong.
     tft.setSwapBytes(true);
     tft.pushImage(lx, ly, logo->width, logo->height, logo->data);
     tft.setSwapBytes(false);
+    logoBottomY = ly + logo->height;
   } else {
-    drawLogo(logoCx, 45, 55, COL_LOGO);
+    drawLogo(cx, 38, 55, COL_LOGO);
+    logoBottomY = 66;
   }
 
-  tft.setTextDatum(MC_DATUM);
-
   if (displayedName.length() == 0) {
+    tft.setTextDatum(MC_DATUM);
     tft.setTextColor(COL_NAME, COL_BG);
-    tft.drawString("Finding cheapest fuel...", cx, 135, 4);
+    tft.drawString("Finding cheapest fuel...", cx, logoBottomY + 40, 4);
     tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
     return;
   }
 
+  // Below the logo: QR on the left, text on the right (left-aligned).
+  int rowY = logoBottomY + 10;
+  int qrWidth = drawDirectionsQRAt(displayedLat, displayedLon, 8, rowY);
+
+  int textX = (qrWidth > 0) ? (8 + qrWidth + 10) : 12;
+  int textMaxW = SCREEN_W - textX - 8;
+
   tft.setTextColor(COL_NAME, COL_BG);
-  int lines = drawNameWrapped(displayedName, cx, 120, SCREEN_W - 20);
+  int lines = drawNameLeftWrapped(displayedName, textX, rowY, textMaxW);
 
   tft.setTextColor(COL_SUBTITLE, COL_BG);
-  int subY = (lines == 2) ? 175 : 165;
-  tft.drawString(displayedSubtitle.c_str(), cx, subY, 4);
+  int subY = rowY + (lines == 2 ? 64 : 32);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString(displayedSubtitle.c_str(), textX, subY, 4);
 
   tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
 }
