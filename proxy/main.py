@@ -16,6 +16,10 @@ log = logging.getLogger("fuelproxy")
 FUEL_HOST = "https://www.fuel-finder.service.gov.uk"
 CLIENT_ID = os.environ.get("FUEL_FINDER_CLIENT_ID")
 CLIENT_SECRET = os.environ.get("FUEL_FINDER_CLIENT_SECRET")
+# HTTP(S) proxy URL for Fuel Finder calls — required when running outside the
+# UK because CloudFront geo-blocks non-UK egress. Format:
+# http://user:pass@host:port
+FUEL_FINDER_PROXY = os.environ.get("FUEL_FINDER_PROXY") or None
 
 REQUEST_SPACING = 2.2          # 30 RPM live limit -> 2.0s, pad to 2.2s
 REFRESH_INTERVAL = 3600        # hourly full refresh
@@ -165,8 +169,8 @@ async def refresh_cache() -> None:
     _cache["refreshing"] = True
     started = time.time()
     try:
-        log.info("Cache refresh starting")
-        async with httpx.AsyncClient() as client:
+        log.info("Cache refresh starting (proxy=%s)", "on" if FUEL_FINDER_PROXY else "off")
+        async with httpx.AsyncClient(proxy=FUEL_FINDER_PROXY, trust_env=False) as client:
             token = await get_access_token(client)
             stations_raw = await fetch_paged(client, "/api/v1/pfs", token, dump_first=True)
             await asyncio.sleep(REQUEST_SPACING)
@@ -218,7 +222,7 @@ async def geocode(postcode: str) -> tuple[float, float, str]:
     pc = "".join(postcode.split()).upper()
     if not pc:
         raise HTTPException(400, "Empty postcode")
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         r = await client.get(f"https://api.postcodes.io/postcodes/{pc}", timeout=10.0)
     if r.status_code == 404:
         raise HTTPException(400, f"Unknown postcode: {postcode}")
