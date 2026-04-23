@@ -2,100 +2,68 @@
  * Petrol Station Display — ESP32-WROOM-32
  *
  * Live UK fuel price display:
- *   - Waveshare 2" ST7789V 320x240 landscape LCD shows station name/location
+ *   - Waveshare 2" ST7789V 320x240 landscape LCD shows station name/town/distance
  *   - Two 3-digit 7-seg modules (daisy-chained) show unleaded/diesel prices in ppl
  *
- * Data source: UK Fuel Finder API (OAuth2 client credentials).
- * Geocoding:   postcodes.io (free, no key).
- * Setup:       Captive portal on first boot (Wi-Fi + postcode + radius).
+ * Data flow:
+ *   ESP32 -> proxy (http://...:8080/cheapest) -> tiny JSON response
+ *
+ * The proxy (FastAPI on a UK VM) holds the OAuth credentials, refreshes the
+ * full Fuel Finder dataset hourly, does the geocoding, haversine, and
+ * cheapest-station selection server-side. The ESP32 does one HTTP GET per
+ * hour and parses ~250 bytes.
  *
  * Required libraries:
  *   - TFT_eSPI (Bodmer) with custom User_Setup.h
  *   - ArduinoJson v7+ (Benoit Blanchon)
- *   - WiFi, WebServer, DNSServer, Preferences, HTTPClient (built-in with ESP32 core)
+ *   - WiFi, WebServer, DNSServer, Preferences, HTTPClient (built-in)
  *
  * Board: ESP32 Dev Module
- *
- * Finds cheapest E10 (unleaded) station within user-specified radius of their
- * postcode, then displays:
- *   - that station's E10 price on the TOP 7-seg module (unleaded)
- *   - that station's B7 (diesel) price on the BOTTOM 7-seg module (diesel)
- *   - station name + town on the LCD
- *
- * Refreshes hourly. Falls back to last cached values if fetch fails.
  */
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <FS.h>
-using fs::FS;  // ESP32 core v3.x workaround
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <time.h>
-#include <math.h>
-#include <esp_task_wdt.h>
 
 // =============================================================
-// Type definitions (declared here so Arduino IDE's auto-generated
-// function prototypes at the top of the translation unit see them.)
+// Types
 // =============================================================
-struct GeoLocation {
-  double lat;
-  double lon;
-  String town;
-  bool valid;
-};
-
-struct NearbyStation {
-  String siteId;
-  String brand;
+struct CheapestStation {
   String name;
+  String brand;
   String town;
-  double lat;
-  double lon;
+  String postcode;
+  String address;
+  bool   isMotorway;
+  bool   isSupermarket;
+  int    priceE10_ppl;   // rounded to whole pence
+  int    priceB7_ppl;
   double distanceMi;
-  int priceE10_ppl;
-  int priceB7_ppl;
+  uint32_t updatedAt;    // unix seconds from proxy
 };
 
 // =============================================================
-// CONFIG — edit these
+// CONFIG
 // =============================================================
-
-// Fuel Finder OAuth credentials (from developer.fuel-finder.service.gov.uk)
-// Once the proxy is live these will be removed entirely — ESP32 hits the
-// proxy, which holds the credentials server-side.
-const char* FUEL_FINDER_CLIENT_ID     = "REPLACE_ME";
-const char* FUEL_FINDER_CLIENT_SECRET = "REPLACE_ME";
-
-// API endpoints
-const char* FUEL_FINDER_BASE = "https://www.fuel-finder.service.gov.uk";
-const char* POSTCODES_IO_BASE = "https://api.postcodes.io";
-
-// Captive portal AP
 const char* PORTAL_SSID = "PetrolStation-Setup";
+const char* PROXY_URL_DEFAULT = "http://79.72.89.239:8080";
 
-// Station branding (the *device itself*, not the displayed fuel station)
-const char* STATION_SUBTITLE = "fuel station";
-
-// NTP
 const char* NTP_SERVER = "time.google.com";
 const char* TZ_UK = "GMT0BST,M3.5.0/1,M10.5.0/2";
 
-// Timing
 const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
-const uint32_t FUEL_REFRESH_INTERVAL_MS = 60UL * 60UL * 1000UL; // 1 hour
+const uint32_t REFRESH_INTERVAL_MS     = 60UL * 60UL * 1000UL; // 1 hour
+const uint32_t RETRY_AFTER_FAIL_MS     = 5UL * 60UL * 1000UL;  // 5 min
+const int      MAX_CONSECUTIVE_FAILURES = 5;
 const uint32_t SPINNER_FRAME_MS = 80;
-const uint32_t DOTS_FRAME_MS = 400;
-
-// Max stations we keep in memory after radius filter (well above typical count)
-constexpr int MAX_STATIONS_IN_RADIUS = 80;
+const uint32_t DOTS_FRAME_MS    = 400;
 
 // Palette
 #define COL_BG            0x10A2
@@ -107,7 +75,6 @@ constexpr int MAX_STATIONS_IN_RADIUS = 80;
 #define COL_FOOTER_TEXT   0xC618
 #define COL_WIFI_OK       0x07E0
 #define COL_WIFI_BAD      0xF800
-#define COL_SUCCESS       0x07E0
 #define COL_ERROR         0xF800
 
 // =============================================================
@@ -225,7 +192,7 @@ private:
 FuelDisplayChain fuel;
 
 // =============================================================
-// Display
+// TFT
 // =============================================================
 TFT_eSPI tft = TFT_eSPI();
 constexpr int SCREEN_W = 320, SCREEN_H = 240;
@@ -261,9 +228,8 @@ void drawWifiIcon(int x, int y, int bars, uint16_t col) {
   }
 }
 
-// Current "station shown on screen" — empty on first boot
-String displayedStationName = "";
-String displayedStationTown = "";
+String displayedName = "";
+String displayedSubtitle = "";
 
 void drawHero() {
   tft.fillRect(0, 0, SCREEN_W, DIVIDER_Y, COL_BG);
@@ -271,25 +237,25 @@ void drawHero() {
   drawDroplet(cx, 55, 70, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
 
-  if (displayedStationName.length() == 0) {
-    // Pre-fetch state
+  if (displayedName.length() == 0) {
     tft.setTextColor(COL_NAME, COL_BG);
     tft.drawString("Finding cheapest fuel...", cx, 140, 2);
-  } else {
-    tft.setTextColor(COL_NAME, COL_BG);
-    // Truncate long names to fit
-    String name = displayedStationName;
-    if (tft.textWidth(name.c_str(), 4) > SCREEN_W - 20) {
-      while (tft.textWidth((name + "...").c_str(), 4) > SCREEN_W - 20 && name.length() > 4) {
-        name.remove(name.length() - 1);
-      }
-      name += "...";
-    }
-    tft.drawString(name.c_str(), cx, 135, 4);
-
-    tft.setTextColor(COL_SUBTITLE, COL_BG);
-    tft.drawString(displayedStationTown.c_str(), cx, 170, 2);
+    tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
+    return;
   }
+
+  tft.setTextColor(COL_NAME, COL_BG);
+  String name = displayedName;
+  if (tft.textWidth(name.c_str(), 4) > SCREEN_W - 20) {
+    while (tft.textWidth((name + "...").c_str(), 4) > SCREEN_W - 20 && name.length() > 4) {
+      name.remove(name.length() - 1);
+    }
+    name += "...";
+  }
+  tft.drawString(name.c_str(), cx, 135, 4);
+
+  tft.setTextColor(COL_SUBTITLE, COL_BG);
+  tft.drawString(displayedSubtitle.c_str(), cx, 170, 2);
 
   tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
 }
@@ -324,7 +290,7 @@ void drawCenteredStatus(const char* title, uint16_t titleCol,
 }
 
 // =============================================================
-// Preferences (NVS storage)
+// Preferences (NVS)
 // =============================================================
 Preferences prefs;
 
@@ -332,17 +298,18 @@ String savedSSID()      { return prefs.getString("ssid", ""); }
 String savedPass()      { return prefs.getString("pass", ""); }
 String savedPostcode()  { return prefs.getString("postcode", ""); }
 int    savedRadius()    { return prefs.getInt("radius_mi", 5); }
+String savedProxyUrl()  { return prefs.getString("proxy_url", PROXY_URL_DEFAULT); }
 
 int    cachedUnleaded() { return prefs.getInt("c_unl", -1); }
 int    cachedDiesel()   { return prefs.getInt("c_dsl", -1); }
 String cachedName()     { return prefs.getString("c_name", ""); }
-String cachedTown()     { return prefs.getString("c_town", ""); }
+String cachedSubtitle() { return prefs.getString("c_sub", ""); }
 
-void savePrices(int u, int d, const String& name, const String& town) {
+void savePrices(int u, int d, const String& name, const String& subtitle) {
   prefs.putInt("c_unl", u);
   prefs.putInt("c_dsl", d);
   prefs.putString("c_name", name);
-  prefs.putString("c_town", town);
+  prefs.putString("c_sub", subtitle);
 }
 
 // =============================================================
@@ -368,6 +335,7 @@ String buildConfigPage(const String& message = "") {
   int n = WiFi.scanNetworks();
   String savedPc = savedPostcode();
   int savedR = savedRadius();
+  String savedPxy = savedProxyUrl();
 
   String html = F("<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
                   "<title>Fuel Display Setup</title>"
@@ -405,6 +373,11 @@ String buildConfigPage(const String& message = "") {
             "<input type=number name=radius min=1 max=50 value='");
   html += String(savedR);
   html += F("' required>"
+            "<label>Proxy URL</label>"
+            "<input type=text name=proxy_url value='");
+  html += htmlEscape(savedPxy);
+  html += F("' required>"
+            "<div class=hint>The UK-hosted proxy that fetches the fuel data.</div>"
             "<button type=submit>Save and connect</button>"
             "</form></body></html>");
   return html;
@@ -418,9 +391,12 @@ void handleSave() {
   String pass = server.arg("pass");
   String pc   = server.arg("postcode");
   int radius  = server.arg("radius").toInt();
+  String pxy  = server.arg("proxy_url");
   pc.trim(); pc.toUpperCase();
+  pxy.trim();
+  while (pxy.endsWith("/")) pxy.remove(pxy.length() - 1);
 
-  if (ssid.length() == 0 || pc.length() == 0 || radius < 1) {
+  if (ssid.length() == 0 || pc.length() == 0 || radius < 1 || pxy.length() == 0) {
     server.send(400, "text/html", buildConfigPage("All fields required."));
     return;
   }
@@ -429,6 +405,7 @@ void handleSave() {
   prefs.putString("pass", pass);
   prefs.putString("postcode", pc);
   prefs.putInt("radius_mi", radius);
+  prefs.putString("proxy_url", pxy);
 
   String body = F("<!DOCTYPE html><html><body style='font-family:sans-serif;background:#101820;color:#fff;padding:20px;'>"
                   "<h2>Saved. Restarting...</h2></body></html>");
@@ -515,509 +492,126 @@ bool tryConnectStored() {
 }
 
 // =============================================================
-// HTTP helpers
+// Proxy fetch
 // =============================================================
+CheapestStation current;
+bool currentValid = false;
 
-// Non-blocking delay that keeps spinner animation running.
-void tickingDelay(uint32_t ms) {
-  uint32_t end = millis() + ms;
-  while (millis() < end) {
-    fuel.tick();
-    delay(5);
-  }
-}
-
-// POST JSON body with retry. Heap-allocated client for safer cleanup.
-bool httpPostJson(const String& url, const String& body, String& response) {
-  WiFiClientSecure* client = new WiFiClientSecure();
-  if (!client) { Serial.println("[http] alloc client failed"); return false; }
-
-  client->setInsecure();
-  client->setHandshakeTimeout(30);
-  client->setTimeout(30);
-
-  bool ok = false;
-  {
-    HTTPClient http;
-    if (http.begin(*client, url)) {
-      http.setTimeout(30000);
-      http.setConnectTimeout(15000);
-      http.addHeader("Content-Type", "application/json");
-      http.addHeader("Accept", "application/json");
-      http.addHeader("User-Agent", "ESP32-FuelDisplay/1.0");
-      int code = http.POST(body);
-      Serial.printf("[http] POST %s -> %d\n", url.c_str(), code);
-      response = http.getString();
-      ok = (code > 0 && code < 300);
-      http.end();
+String urlEncode(const String& s) {
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      char buf[4];
+      snprintf(buf, sizeof(buf), "%%%02X", (unsigned char)c);
+      out += buf;
     }
   }
-
-  delete client;
-  return ok;
+  return out;
 }
 
-// GET with optional bearer auth. Returns full body on success.
-bool httpGetString(const String& url, const String& bearer, String& response) {
-  WiFiClientSecure* client = new WiFiClientSecure();
-  if (!client) { Serial.println("[http] alloc client failed"); return false; }
+bool fetchCheapest() {
+  String url = savedProxyUrl()
+             + "/cheapest?postcode=" + urlEncode(savedPostcode())
+             + "&radius_miles=" + String(savedRadius());
+  Serial.printf("[proxy] GET %s\n", url.c_str());
 
-  client->setInsecure();
-  client->setHandshakeTimeout(30);
-  client->setTimeout(30);
-
-  bool ok = false;
-  {
-    HTTPClient http;
-    if (http.begin(*client, url)) {
-      http.setTimeout(30000);
-      http.setConnectTimeout(15000);
-      http.addHeader("Accept", "application/json");
-      http.addHeader("User-Agent", "ESP32-FuelDisplay/1.0");
-      if (bearer.length()) http.addHeader("Authorization", "Bearer " + bearer);
-
-      int code = http.GET();
-      int contentLen = http.getSize();
-      Serial.printf("[http] GET %s -> %d (content-length: %d)\n",
-                    url.c_str(), code, contentLen);
-
-      response = http.getString();
-
-      // If getString returned empty but there's supposed to be a body, try stream read
-      if (code > 0 && code < 300 && response.length() == 0 && contentLen != 0) {
-        Serial.println("[http] getString empty, trying stream read...");
-        WiFiClient* stream = http.getStreamPtr();
-        uint32_t start = millis();
-        while (stream->connected() && (millis() - start) < 20000) {
-          while (stream->available()) {
-            response += (char)stream->read();
-          }
-          if (contentLen > 0 && (int)response.length() >= contentLen) break;
-          delay(10);
-          fuel.tick();
-        }
-        Serial.printf("[http] stream read got %d bytes\n", response.length());
-      }
-
-      if (code > 0 && code < 300) {
-        ok = true;
-      } else {
-        if (response.length()) {
-          Serial.println("[http] error body:");
-          Serial.println(response);
-        }
-      }
-      http.end();
-    }
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, url)) {
+    Serial.println("[proxy] http.begin failed");
+    return false;
   }
+  http.setTimeout(15000);
+  http.setConnectTimeout(5000);
+  http.addHeader("Accept", "application/json");
+  http.addHeader("User-Agent", "ESP32-FuelDisplay/2.0");
 
-  delete client;
-  return ok;
-}
+  int code = http.GET();
+  String body = http.getString();
+  http.end();
 
-// =============================================================
-// Geocoding (postcodes.io)
-// =============================================================
-GeoLocation geocodePostcode(const String& postcode) {
-  GeoLocation g = { 0, 0, "", false };
-  String url = String(POSTCODES_IO_BASE) + "/postcodes/" + postcode;
-  url.replace(" ", "");
-
-  String response;
-  if (!httpGetString(url, "", response)) return g;
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, response);
-  if (err) { Serial.printf("[geo] parse err: %s\n", err.c_str()); return g; }
-
-  if (doc["status"].as<int>() == 200) {
-    g.lat = doc["result"]["latitude"].as<double>();
-    g.lon = doc["result"]["longitude"].as<double>();
-    const char* t = doc["result"]["admin_district"] | doc["result"]["parish"] | doc["result"]["region"] | "";
-    g.town = String(t);
-    g.valid = true;
-  }
-  return g;
-}
-
-// =============================================================
-// Fuel Finder OAuth + fetch
-// =============================================================
-String fuelFinderToken;
-
-bool fetchAccessToken() {
-  String url = String(FUEL_FINDER_BASE) + "/api/v1/oauth/generate_access_token";
-  JsonDocument reqDoc;
-  reqDoc["grant_type"] = "client_credentials";
-  reqDoc["client_id"] = FUEL_FINDER_CLIENT_ID;
-  reqDoc["client_secret"] = FUEL_FINDER_CLIENT_SECRET;
-  String body;
-  serializeJson(reqDoc, body);
-
-  // Safety: refuse to proceed if credentials weren't replaced
-  if (String(FUEL_FINDER_CLIENT_ID).indexOf("YOUR_") >= 0 ||
-      String(FUEL_FINDER_CLIENT_SECRET).indexOf("YOUR_") >= 0) {
-    Serial.println("[oauth] credentials not set in sketch");
+  Serial.printf("[proxy] -> %d, %d bytes\n", code, body.length());
+  if (code != 200) {
+    if (body.length()) { Serial.println(body); }
     return false;
   }
 
-  // Retry up to 3 times — first TLS handshake to a new host sometimes stalls
-  String response;
-  bool ok = false;
-  for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
-    Serial.printf("[oauth] attempt %d\n", attempt);
-    ok = httpPostJson(url, body, response);
-    if (!ok && attempt < 3) {
-      Serial.println("[oauth] retrying in 2s...");
-      tickingDelay(2000);
-    }
-  }
-  if (!ok) {
-    Serial.println("[oauth] all retries failed");
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[proxy] json parse: %s\n", err.c_str());
     return false;
   }
 
-  Serial.println("[oauth] raw response:");
-  Serial.println(response);
-
-  JsonDocument doc;
-  DeserializationError err = deserializeJson(doc, response);
-  if (err) { Serial.printf("[oauth] parse err: %s\n", err.c_str()); return false; }
-
-  const char* tok = doc["access_token"] | doc["accessToken"] | doc["token"] | (const char*)nullptr;
-  if (!tok) {
-    tok = doc["data"]["access_token"] | doc["data"]["accessToken"] | (const char*)nullptr;
-  }
-  if (!tok) { Serial.println("[oauth] no access_token in response"); return false; }
-  fuelFinderToken = String(tok);
-  Serial.printf("[oauth] token acquired (length %d)\n", fuelFinderToken.length());
+  current.name          = (const char*)(doc["name"]     | "");
+  current.brand         = (const char*)(doc["brand"]    | "");
+  current.town          = (const char*)(doc["town"]     | "");
+  current.postcode      = (const char*)(doc["postcode"] | "");
+  current.address       = (const char*)(doc["address"]  | "");
+  current.isMotorway    = doc["is_motorway"]    | false;
+  current.isSupermarket = doc["is_supermarket"] | false;
+  double e10 = doc["e10"] | 0.0;
+  double b7  = doc["b7"]  | 0.0;
+  current.priceE10_ppl = (e10 > 0.0) ? (int)round(e10) : -1;
+  current.priceB7_ppl  = (b7  > 0.0) ? (int)round(b7)  : -1;
+  current.distanceMi   = doc["distance"]   | 0.0;
+  current.updatedAt    = doc["updated_at"] | 0;
+  currentValid = true;
   return true;
 }
 
-// Haversine distance in miles
-double haversineMiles(double lat1, double lon1, double lat2, double lon2) {
-  const double R = 3958.8; // Earth radius in miles
-  double dLat = (lat2 - lat1) * M_PI / 180.0;
-  double dLon = (lon2 - lon1) * M_PI / 180.0;
-  double a = sin(dLat/2)*sin(dLat/2) +
-             cos(lat1*M_PI/180.0) * cos(lat2*M_PI/180.0) *
-             sin(dLon/2)*sin(dLon/2);
-  return 2 * R * atan2(sqrt(a), sqrt(1-a));
+// Combine "Dover • 3.8 mi" style subtitle
+String buildSubtitle(const CheapestStation& s) {
+  String out = s.town;
+  if (s.distanceMi > 0) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), " \xE2\x80\xA2 %.1f mi", s.distanceMi);
+    out += buf;
+  }
+  return out;
 }
 
-// Stations within radius (kept in memory). Keyed by site_id for price lookup.
-NearbyStation nearby[MAX_STATIONS_IN_RADIUS];
-int nearbyCount = 0;
-
-// Stream-parse from HTTP response so we never hold the full body in RAM.
-// ArduinoJson with filter reads bytes sequentially and keeps only matched fields.
-bool fetchStationsWithinRadius(double originLat, double originLon, double radiusMi) {
-  nearbyCount = 0;
-  int batch = 1;
-
-  while (true) {
-    String url = String(FUEL_FINDER_BASE) + "/api/v1/pfs?batch-number=" + String(batch);
-    WiFiClientSecure* client = new WiFiClientSecure();
-    if (!client) { Serial.println("[pfs] client alloc failed"); return false; }
-    client->setInsecure();
-    client->setHandshakeTimeout(30);
-    client->setTimeout(30);
-
-    HTTPClient http;
-    bool iterOk = false;
-    int pageItemCount = 0;
-
-    if (http.begin(*client, url)) {
-      http.setTimeout(60000);
-      http.setConnectTimeout(15000);
-      http.addHeader("Accept", "application/json");
-      http.addHeader("User-Agent", "ESP32-FuelDisplay/1.0");
-      http.addHeader("Authorization", "Bearer " + fuelFinderToken);
-
-      int code = http.GET();
-      int contentLen = http.getSize();
-      Serial.printf("[pfs] batch %d GET -> %d (len %d)\n", batch, code, contentLen);
-
-      if (code > 0 && code < 300) {
-        // Feed a watchdog-aware Stream wrapper into ArduinoJson.
-        // The filter tells the parser to only keep these fields — everything else is discarded in-flight.
-        JsonDocument filter;
-        filter[0]["node_id"] = true;
-        filter[0]["trading_name"] = true;
-        filter[0]["brand_name"] = true;
-        filter[0]["permanent_closure"] = true;
-        filter[0]["temporary_closure"] = true;
-        filter[0]["location"] = true;
-
-        JsonDocument doc;
-        Serial.println("[pfs] streaming parse begins...");
-        uint32_t parseStart = millis();
-
-        DeserializationError err = deserializeJson(doc,
-                                                   *http.getStreamPtr(),
-                                                   DeserializationOption::Filter(filter));
-        uint32_t parseTime = millis() - parseStart;
-        Serial.printf("[pfs] parse took %lu ms, result: %s\n", parseTime, err.c_str());
-
-        if (err) {
-          // IncompleteInput may just mean the connection is still streaming — try again with more read time.
-          Serial.printf("[pfs] parse err batch %d: %s\n", batch, err.c_str());
-        } else {
-          JsonArray items = doc.as<JsonArray>();
-          for (JsonObject item : items) {
-            pageItemCount++;
-            if ((pageItemCount & 0x1F) == 0) fuel.tick();
-            if (nearbyCount >= MAX_STATIONS_IN_RADIUS) break;
-
-            bool perm = item["permanent_closure"] | false;
-            bool temp = item["temporary_closure"] | false;
-            if (perm || temp) continue;
-
-            JsonVariant loc = item["location"];
-            if (batch == 1 && pageItemCount <= 2) {
-              Serial.printf("[pfs] station %d location: ", pageItemCount);
-              serializeJson(loc, Serial);
-              Serial.println();
-            }
-
-            double lat = 0.0, lon = 0.0;
-            if (loc.is<JsonObject>()) {
-              lat = loc["latitude"]  | loc["lat"] | loc["Latitude"] | 0.0;
-              lon = loc["longitude"] | loc["lon"] | loc["lng"] | loc["Longitude"] | 0.0;
-            }
-            if (lat == 0.0 && lon == 0.0) continue;
-
-            double dist = haversineMiles(originLat, originLon, lat, lon);
-            if (dist > radiusMi) continue;
-
-            NearbyStation& s = nearby[nearbyCount++];
-            s.siteId = item["node_id"].as<const char*>() ? item["node_id"].as<const char*>() : "";
-            s.brand  = item["brand_name"].as<const char*>() ? item["brand_name"].as<const char*>() : "";
-            s.name   = item["trading_name"].as<const char*>() ? item["trading_name"].as<const char*>() : "";
-            s.town   = "";
-            s.lat = lat; s.lon = lon; s.distanceMi = dist;
-            s.priceE10_ppl = -1; s.priceB7_ppl = -1;
-          }
-          iterOk = true;
-          Serial.printf("[pfs] batch %d: %d stations, %d in radius total\n",
-                        batch, pageItemCount, nearbyCount);
-        }
-      } else {
-        Serial.printf("[pfs] HTTP error %d\n", code);
-      }
-      http.end();
-    }
-    delete client;
-
-    if (!iterOk) return false;
-    if (pageItemCount < 400) break;
-    batch++;
-    tickingDelay(2100);
-  }
-  Serial.printf("[pfs] %d stations within %.1f mi\n", nearbyCount, radiusMi);
-  return true;
-}
-
-// Stream-parse fuel prices.
-bool fetchPrices() {
-  int batch = 1;
-  while (true) {
-    String url = String(FUEL_FINDER_BASE) + "/api/v1/pfs/fuel-prices?batch-number=" + String(batch);
-    WiFiClientSecure* client = new WiFiClientSecure();
-    if (!client) { Serial.println("[prices] client alloc failed"); return false; }
-    client->setInsecure();
-    client->setHandshakeTimeout(30);
-    client->setTimeout(30);
-
-    HTTPClient http;
-    bool iterOk = false;
-    int pageItemCount = 0;
-
-    if (http.begin(*client, url)) {
-      http.setTimeout(60000);
-      http.setConnectTimeout(15000);
-      http.addHeader("Accept", "application/json");
-      http.addHeader("User-Agent", "ESP32-FuelDisplay/1.0");
-      http.addHeader("Authorization", "Bearer " + fuelFinderToken);
-
-      int code = http.GET();
-      int contentLen = http.getSize();
-      Serial.printf("[prices] batch %d GET -> %d (len %d)\n", batch, code, contentLen);
-
-      if (code > 0 && code < 300) {
-        JsonDocument filter;
-        filter[0]["node_id"] = true;
-        filter[0]["fuel_prices"] = true;
-
-        JsonDocument doc;
-        Serial.println("[prices] streaming parse begins...");
-        uint32_t parseStart = millis();
-        DeserializationError err = deserializeJson(doc,
-                                                   *http.getStreamPtr(),
-                                                   DeserializationOption::Filter(filter));
-        uint32_t parseTime = millis() - parseStart;
-        Serial.printf("[prices] parse took %lu ms, result: %s\n", parseTime, err.c_str());
-
-        if (!err) {
-          JsonArray items = doc.as<JsonArray>();
-          int matched = 0;
-          for (JsonObject item : items) {
-            pageItemCount++;
-            if ((pageItemCount & 0x1F) == 0) fuel.tick();
-            const char* nodeId = item["node_id"] | "";
-            JsonVariant fuelPrices = item["fuel_prices"];
-
-            if (batch == 1 && pageItemCount <= 2) {
-              Serial.printf("[prices] station %d fuel_prices: ", pageItemCount);
-              serializeJson(fuelPrices, Serial);
-              Serial.println();
-            }
-
-            int idx = -1;
-            for (int i=0; i<nearbyCount; i++) {
-              if (nearby[i].siteId == nodeId) { idx = i; break; }
-            }
-            if (idx < 0 || !fuelPrices.is<JsonArray>()) continue;
-
-            for (JsonObject fp : fuelPrices.as<JsonArray>()) {
-              const char* type = fp["fuel_type"] | fp["grade"] | fp["fuel_grade"]
-                               | fp["type"] | fp["name"] | "";
-              double priceVal = fp["price"] | fp["price_per_litre"] | fp["pricePerLitre"]
-                              | fp["ppl"] | fp["amount"] | 0.0;
-              if (priceVal <= 0.0 || type[0] == 0) continue;
-              int ppl = (priceVal > 10.0) ? (int)round(priceVal) : (int)round(priceVal * 100.0);
-              if (strstr(type, "E10") || strcasecmp(type, "unleaded") == 0) {
-                nearby[idx].priceE10_ppl = ppl; matched++;
-              } else if (strstr(type, "B7") || strcasecmp(type, "diesel") == 0) {
-                nearby[idx].priceB7_ppl = ppl; matched++;
-              }
-            }
-          }
-          iterOk = true;
-          Serial.printf("[prices] batch %d: %d stations, %d matches\n",
-                        batch, pageItemCount, matched);
-        }
-      }
-      http.end();
-    }
-    delete client;
-
-    if (!iterOk) return false;
-    if (pageItemCount < 400) break;
-    batch++;
-    tickingDelay(2100);
-  }
-  return true;
-}
-
-// Main refresh cycle.
-// @param silent true = no spinner, no status screens (for background hourly refreshes)
-bool refreshFuelData(bool silent = false) {
-  // Disable task WDT during refresh — long HTTPS reads will starve it otherwise
-  esp_task_wdt_deinit();
-
-  Serial.printf("[fuel] refresh start (silent=%d, free heap: %d, largest block: %d)\n",
-                silent, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-
-  // Heap safety gate: TLS needs ~50KB contiguous. Abort if we're dangerously low.
-  if (ESP.getMaxAllocHeap() < 60000) {
-    Serial.println("[fuel] heap too fragmented, rebooting for clean state");
-    delay(1000);
-    ESP.restart();
-  }
-
+bool refreshFuelData(bool silent) {
+  Serial.printf("[refresh] start (silent=%d)\n", silent);
   if (!silent) {
     fuel.setMode(SegMode::SPINNER);
-    drawCenteredStatus("Fetching prices...", COL_NAME, "Geocoding postcode", nullptr);
+    drawCenteredStatus("Fetching prices...", COL_NAME, "Querying proxy", nullptr);
   }
 
-  // Brief settle delay lets WiFi stack finish any background work
-  tickingDelay(500);
-
-  GeoLocation geo = geocodePostcode(savedPostcode());
-  if (!geo.valid) {
-    Serial.println("[fuel] geocode failed");
+  if (!fetchCheapest()) {
     if (!silent) {
-      drawCenteredStatus("Postcode error", COL_ERROR, "Check postcode in setup", nullptr);
-      delay(3000);
-    }
-    return false;
-  }
-  Serial.printf("[fuel] origin %.4f,%.4f (%s)\n", geo.lat, geo.lon, geo.town.c_str());
-  Serial.printf("[fuel] heap after geocode: %d / largest %d\n",
-                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
-
-  if (!silent) drawCenteredStatus("Fetching prices...", COL_NAME, "Authenticating", nullptr);
-  if (!fetchAccessToken()) {
-    if (!silent) {
-      drawCenteredStatus("Auth failed", COL_ERROR, "Check API credentials", nullptr);
+      drawCenteredStatus("Fetch failed", COL_ERROR, "Proxy unreachable", nullptr);
       delay(3000);
     }
     return false;
   }
 
-  if (!silent) drawCenteredStatus("Fetching prices...", COL_NAME, "Finding nearby stations", nullptr);
-  if (!fetchStationsWithinRadius(geo.lat, geo.lon, savedRadius())) {
-    if (!silent) {
-      drawCenteredStatus("Fetch failed", COL_ERROR, "Stations list", nullptr);
-      delay(3000);
-    }
-    return false;
-  }
-  if (nearbyCount == 0) {
-    if (!silent) {
-      drawCenteredStatus("No stations found", COL_ERROR, "Try a larger radius", nullptr);
-      delay(3000);
-    }
-    return false;
-  }
+  String shownName = current.name.length() ? current.name : current.brand;
+  if (shownName.length() == 0) shownName = "(unnamed)";
+  displayedName = shownName;
+  displayedSubtitle = buildSubtitle(current);
 
-  if (!silent) drawCenteredStatus("Fetching prices...", COL_NAME, "Loading price data", nullptr);
-  if (!fetchPrices()) {
-    if (!silent) {
-      drawCenteredStatus("Fetch failed", COL_ERROR, "Price data", nullptr);
-      delay(3000);
-    }
-    return false;
-  }
-
-  // Pick cheapest E10 station
-  int bestIdx = -1;
-  int bestE10 = INT_MAX;
-  for (int i=0; i<nearbyCount; i++) {
-    if (nearby[i].priceE10_ppl > 0 && nearby[i].priceE10_ppl < bestE10) {
-      bestE10 = nearby[i].priceE10_ppl;
-      bestIdx = i;
-    }
-  }
-  if (bestIdx < 0) {
-    if (!silent) {
-      drawCenteredStatus("No unleaded data", COL_ERROR, "None of the nearby stations", "had E10 prices");
-      delay(3000);
-    }
-    return false;
-  }
-
-  NearbyStation& best = nearby[bestIdx];
-  Serial.printf("[fuel] cheapest E10: %s (%s) %dppl E10, %dppl B7, %.2fmi\n",
-                best.name.c_str(), best.brand.c_str(),
-                best.priceE10_ppl, best.priceB7_ppl, best.distanceMi);
-
-  // Update UI
-  String shownName = best.brand.length() ? best.brand : best.name;
-  displayedStationName = shownName;
-  displayedStationTown = best.town.length() ? best.town : geo.town;
-  fuel.setPrices(best.priceE10_ppl, best.priceB7_ppl > 0 ? best.priceB7_ppl : 0);
+  fuel.setPrices(
+    current.priceE10_ppl > 0 ? current.priceE10_ppl : 0,
+    current.priceB7_ppl  > 0 ? current.priceB7_ppl  : 0
+  );
   fuel.setMode(SegMode::PRICES);
-  savePrices(best.priceE10_ppl, best.priceB7_ppl, displayedStationName, displayedStationTown);
 
+  savePrices(current.priceE10_ppl, current.priceB7_ppl, displayedName, displayedSubtitle);
   drawHero();
-  Serial.println("[fuel] refresh complete");
+
+  Serial.printf("[refresh] ok: %s — %d/%dppl — %.1fmi\n",
+                displayedName.c_str(),
+                current.priceE10_ppl, current.priceB7_ppl,
+                current.distanceMi);
   return true;
 }
 
 // =============================================================
-// Setup & Loop
+// Setup & loop
 // =============================================================
 bool fetchTimeString(char* out, size_t outSize) {
   struct tm tm;
@@ -1036,9 +630,9 @@ void setup() {
   tft.setRotation(1);
   prefs.begin("fuelstation", false);
 
-  // Restore cached display so screen isn't empty during first refresh
-  displayedStationName = cachedName();
-  displayedStationTown = cachedTown();
+  // Restore cached display from last successful refresh
+  displayedName = cachedName();
+  displayedSubtitle = cachedSubtitle();
   int cu = cachedUnleaded(), cd = cachedDiesel();
   if (cu > 0) fuel.setPrices(cu, cd > 0 ? cd : 0);
   fuel.setMode(SegMode::BLANK);
@@ -1046,8 +640,7 @@ void setup() {
   drawHero();
   drawFooter("--:--", 0, "starting", COL_FOOTER_TEXT);
 
-  // Must have Wi-Fi creds AND a postcode to go live
-  if (savedSSID().length() == 0 || savedPostcode().length() == 0) {
+  if (savedSSID().length() == 0 || savedPostcode().length() == 0 || savedProxyUrl().length() == 0) {
     startCaptivePortal();
     return;
   }
@@ -1057,15 +650,12 @@ void setup() {
     return;
   }
 
-  // Connected — do first refresh (visible so user sees progress)
   refreshFuelData(false);
 }
 
 uint32_t lastRefreshMs = 0;
 bool lastRefreshOk = false;
-int consecutiveFailures = 0;
-const uint32_t RETRY_AFTER_FAIL_MS = 5UL * 60UL * 1000UL;  // 5 min after a failure
-const int MAX_CONSECUTIVE_FAILURES = 3;  // reboot after this many
+int  consecutiveFailures = 0;
 
 void loop() {
   fuel.tick();
@@ -1077,20 +667,19 @@ void loop() {
     return;
   }
 
-  uint32_t interval = lastRefreshOk ? FUEL_REFRESH_INTERVAL_MS : RETRY_AFTER_FAIL_MS;
+  uint32_t interval = lastRefreshOk ? REFRESH_INTERVAL_MS : RETRY_AFTER_FAIL_MS;
   if (millis() - lastRefreshMs >= interval || lastRefreshMs == 0) {
     if (WiFi.status() == WL_CONNECTED) {
       lastRefreshMs = millis();
-      // First refresh of this boot = visible; subsequent = silent
-      bool silent = lastRefreshOk;
+      bool silent = lastRefreshOk;  // first boot = visible, then silent
       lastRefreshOk = refreshFuelData(silent);
       if (lastRefreshOk) {
         consecutiveFailures = 0;
       } else {
         consecutiveFailures++;
-        Serial.printf("[fuel] consecutive failures: %d\n", consecutiveFailures);
+        Serial.printf("[refresh] consecutive failures: %d\n", consecutiveFailures);
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          Serial.println("[fuel] too many failures, rebooting");
+          Serial.println("[refresh] too many failures, rebooting");
           delay(1000);
           ESP.restart();
         }
@@ -1098,7 +687,7 @@ void loop() {
     }
   }
 
-  // 1Hz UI tick
+  // 1 Hz footer tick
   static uint32_t lastUiTick = 0;
   if (millis() - lastUiTick < 1000) { delay(20); return; }
   lastUiTick = millis();
