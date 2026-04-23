@@ -361,6 +361,24 @@ async def cheapest(
     }
 
 
+@app.get("/brands")
+async def brands():
+    """Unique brand_name values in the current cache, sorted by frequency."""
+    await _wait_for_cache()
+    counts: dict[str, int] = {}
+    for s in _cache["stations"].values():
+        b = (s.get("brand") or "").strip()
+        if not b:
+            continue
+        counts[b] = counts.get(b, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return {
+        "total_stations": len(_cache["stations"]),
+        "unique_brands": len(ranked),
+        "brands": [{"name": n, "count": c} for n, c in ranked],
+    }
+
+
 @app.get("/health")
 async def health():
     return {
