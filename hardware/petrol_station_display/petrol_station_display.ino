@@ -346,6 +346,7 @@ String buildConfigPage(const String& message = "") {
   String savedPc = savedPostcode();
   int savedR = savedRadius();
   String savedPxy = savedProxyUrl();
+  String savedWifi = savedSSID();
 
   String html = F("<!DOCTYPE html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>"
                   "<title>Fuel Display Setup</title>"
@@ -369,11 +370,13 @@ String buildConfigPage(const String& message = "") {
   for (int i=0; i<n; i++) {
     String ssid = WiFi.SSID(i);
     int32_t rssi = WiFi.RSSI(i);
-    html += "<option value='" + htmlEscape(ssid) + "'>" + htmlEscape(ssid) + " (" + String(rssi) + " dBm)</option>";
+    String sel = (ssid == savedWifi) ? " selected" : "";
+    html += "<option" + sel + " value='" + htmlEscape(ssid) + "'>" + htmlEscape(ssid) + " (" + String(rssi) + " dBm)</option>";
   }
   html += F("</select>"
             "<label>Wi-Fi password</label>"
             "<input type=password name=pass>"
+            "<div class=hint>Leave blank to keep the current password.</div>"
             "<label>UK postcode</label>"
             "<input type=text name=postcode placeholder='e.g. NR31 0DF' value='");
   html += htmlEscape(savedPc);
@@ -407,12 +410,12 @@ void handleSave() {
   while (pxy.endsWith("/")) pxy.remove(pxy.length() - 1);
 
   if (ssid.length() == 0 || pc.length() == 0 || radius < 1 || pxy.length() == 0) {
-    server.send(400, "text/html", buildConfigPage("All fields required."));
+    server.send(400, "text/html", buildConfigPage("All fields except password are required."));
     return;
   }
 
   prefs.putString("ssid", ssid);
-  prefs.putString("pass", pass);
+  if (pass.length() > 0) prefs.putString("pass", pass);
   prefs.putString("postcode", pc);
   prefs.putInt("radius_mi", radius);
   prefs.putString("proxy_url", pxy);
@@ -631,6 +634,30 @@ bool fetchTimeString(char* out, size_t outSize) {
   return true;
 }
 
+// Splash shown for a few seconds after WiFi connects, so the user can see the
+// LAN IP and open the settings page.
+void drawBootIpSplash(const IPAddress& ip) {
+  tft.fillRect(0, 0, SCREEN_W, DIVIDER_Y, COL_BG);
+  int cx = SCREEN_W / 2;
+  drawDroplet(cx, 40, 50, COL_LOGO);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(COL_NAME, COL_BG);
+  tft.drawString("Settings at", cx, 100, 4);
+  tft.setTextColor(COL_ACCENT, COL_BG);
+  tft.drawString(ip.toString().c_str(), cx, 140, 4);
+  tft.setTextColor(COL_FOOTER_TEXT, COL_BG);
+  tft.drawString("Open in a browser to change", cx, 175, 2);
+  tft.drawString("postcode or radius", cx, 195, 2);
+  tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
+}
+
+void startSettingsServer() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.begin();
+  Serial.printf("[web] settings at http://%s/\n", WiFi.localIP().toString().c_str());
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -660,6 +687,18 @@ void setup() {
     return;
   }
 
+  startSettingsServer();
+
+  // Hold the IP splash for 10s so the user can jot it down and open settings.
+  // Web server stays up afterwards — the splash is just for discoverability.
+  drawBootIpSplash(WiFi.localIP());
+  uint32_t splashUntil = millis() + 10000;
+  while ((int32_t)(splashUntil - millis()) > 0) {
+    server.handleClient();
+    fuel.tick();
+    delay(10);
+  }
+
   refreshFuelData(false);
 }
 
@@ -676,6 +715,9 @@ void loop() {
     delay(2);
     return;
   }
+
+  // Settings web UI stays reachable while on the home network
+  server.handleClient();
 
   uint32_t interval = lastRefreshOk ? REFRESH_INTERVAL_MS : RETRY_AFTER_FAIL_MS;
   if (millis() - lastRefreshMs >= interval || lastRefreshMs == 0) {
