@@ -75,8 +75,6 @@ const uint32_t DOTS_FRAME_MS    = 400;
 #define COL_SUBTITLE      0xFFFF
 #define COL_DIVIDER       0x4208
 #define COL_FOOTER_TEXT   0xC618
-#define COL_WIFI_OK       0x07E0
-#define COL_WIFI_BAD      0xF800
 #define COL_ERROR         0xF800
 
 // =============================================================
@@ -202,14 +200,6 @@ constexpr int FOOTER_H = 28;
 constexpr int FOOTER_Y = SCREEN_H - FOOTER_H;
 constexpr int DIVIDER_Y = FOOTER_Y - 4;
 
-int signalBars(int32_t rssi) {
-  if (rssi >= -55) return 4;
-  if (rssi >= -65) return 3;
-  if (rssi >= -75) return 2;
-  if (rssi >= -85) return 1;
-  return 0;
-}
-
 void drawDroplet(int cx, int cy, int h, uint16_t col) {
   int r = h / 3;
   int circleCy = cy + h / 4;
@@ -220,63 +210,81 @@ void drawDroplet(int cx, int cy, int h, uint16_t col) {
   tft.fillCircle(cx - r / 3, circleCy - r / 3, r / 6, COL_SUBTITLE);
 }
 
-void drawWifiIcon(int x, int y, int bars, uint16_t col) {
-  const int barW = 3, barGap = 2;
-  const int heights[4] = {4, 7, 10, 13};
-  for (int i=0; i<4; i++) {
-    int bx = x + i * (barW + barGap), bh = heights[i], by = y - bh;
-    uint16_t c = (i < bars) ? col : COL_DIVIDER;
-    tft.fillRect(bx, by, barW, bh, c);
-  }
-}
-
 String displayedName = "";
 String displayedSubtitle = "";
+
+// Draw `text` in font 4, wrapping onto two lines on the last space that still
+// fits line 1. Returns 1 or 2 depending on how many lines were drawn.
+int drawNameWrapped(const String& text, int cx, int centerY, int maxW) {
+  if (tft.textWidth(text.c_str(), 4) <= maxW) {
+    tft.drawString(text.c_str(), cx, centerY, 4);
+    return 1;
+  }
+
+  int splitIdx = -1;
+  for (int i = (int)text.length() - 1; i > 0; i--) {
+    if (text.charAt(i) == ' ') {
+      String first = text.substring(0, i);
+      if (tft.textWidth(first.c_str(), 4) <= maxW) {
+        splitIdx = i;
+        break;
+      }
+    }
+  }
+
+  if (splitIdx < 0) {
+    // Single word too wide — truncate with ellipsis
+    String trimmed = text;
+    while (tft.textWidth((trimmed + "...").c_str(), 4) > maxW && trimmed.length() > 4) {
+      trimmed.remove(trimmed.length() - 1);
+    }
+    trimmed += "...";
+    tft.drawString(trimmed.c_str(), cx, centerY, 4);
+    return 1;
+  }
+
+  String line1 = text.substring(0, splitIdx);
+  String line2 = text.substring(splitIdx + 1);
+  if (tft.textWidth(line2.c_str(), 4) > maxW) {
+    while (tft.textWidth((line2 + "...").c_str(), 4) > maxW && line2.length() > 4) {
+      line2.remove(line2.length() - 1);
+    }
+    line2 += "...";
+  }
+  const int lineH = 30;
+  tft.drawString(line1.c_str(), cx, centerY - lineH / 2, 4);
+  tft.drawString(line2.c_str(), cx, centerY + lineH / 2, 4);
+  return 2;
+}
 
 void drawHero() {
   tft.fillRect(0, 0, SCREEN_W, DIVIDER_Y, COL_BG);
   int cx = SCREEN_W / 2;
-  drawDroplet(cx, 55, 70, COL_LOGO);
+  drawDroplet(cx, 45, 55, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
 
   if (displayedName.length() == 0) {
     tft.setTextColor(COL_NAME, COL_BG);
-    tft.drawString("Finding cheapest fuel...", cx, 140, 2);
+    tft.drawString("Finding cheapest fuel...", cx, 135, 4);
     tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
     return;
   }
 
   tft.setTextColor(COL_NAME, COL_BG);
-  String name = displayedName;
-  if (tft.textWidth(name.c_str(), 4) > SCREEN_W - 20) {
-    while (tft.textWidth((name + "...").c_str(), 4) > SCREEN_W - 20 && name.length() > 4) {
-      name.remove(name.length() - 1);
-    }
-    name += "...";
-  }
-  tft.drawString(name.c_str(), cx, 135, 4);
+  int lines = drawNameWrapped(displayedName, cx, 120, SCREEN_W - 20);
 
   tft.setTextColor(COL_SUBTITLE, COL_BG);
-  tft.drawString(displayedSubtitle.c_str(), cx, 170, 2);
+  int subY = (lines == 2) ? 175 : 165;
+  tft.drawString(displayedSubtitle.c_str(), cx, subY, 4);
 
   tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
 }
 
-void drawFooter(const char* timeStr, int wifiBars, const char* wifiLabel, uint16_t wifiCol) {
+void drawFooter(const char* timeStr) {
   tft.fillRect(0, FOOTER_Y, SCREEN_W, FOOTER_H, COL_BG);
-  tft.setTextDatum(ML_DATUM);
+  tft.setTextDatum(MC_DATUM);
   tft.setTextColor(COL_FOOTER_TEXT, COL_BG);
-  tft.drawString(timeStr, 12, FOOTER_Y + FOOTER_H / 2, 2);
-
-  int iconY = FOOTER_Y + FOOTER_H - 6;
-  int labelRightX = SCREEN_W - 12;
-  tft.setTextDatum(MR_DATUM);
-  tft.setTextColor(wifiCol, COL_BG);
-  int labelW = tft.textWidth(wifiLabel, 2);
-  tft.drawString(wifiLabel, labelRightX, FOOTER_Y + FOOTER_H / 2, 2);
-  int iconX = labelRightX - labelW - 28;
-  uint16_t iconCol = (wifiBars > 0) ? COL_WIFI_OK : COL_WIFI_BAD;
-  drawWifiIcon(iconX, iconY, wifiBars, iconCol);
+  tft.drawString(timeStr, SCREEN_W / 2, FOOTER_Y + FOOTER_H / 2, 2);
 }
 
 void drawCenteredStatus(const char* title, uint16_t titleCol,
@@ -640,7 +648,7 @@ void setup() {
   fuel.setMode(SegMode::BLANK);
 
   drawHero();
-  drawFooter("--:--", 0, "starting", COL_FOOTER_TEXT);
+  drawFooter("--:--");
 
   if (savedSSID().length() == 0 || savedPostcode().length() == 0 || savedProxyUrl().length() == 0) {
     startCaptivePortal();
@@ -696,14 +704,5 @@ void loop() {
 
   char timeStr[16] = "--:--";
   if (WiFi.status() == WL_CONNECTED) fetchTimeString(timeStr, sizeof(timeStr));
-
-  if (WiFi.status() == WL_CONNECTED) {
-    int32_t rssi = WiFi.RSSI();
-    int bars = signalBars(rssi);
-    char label[16];
-    snprintf(label, sizeof(label), "%d dBm", rssi);
-    drawFooter(timeStr, bars, label, COL_WIFI_OK);
-  } else {
-    drawFooter(timeStr, 0, "offline", COL_WIFI_BAD);
-  }
+  drawFooter(timeStr);
 }
