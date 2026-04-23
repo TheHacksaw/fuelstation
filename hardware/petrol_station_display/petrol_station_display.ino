@@ -200,14 +200,42 @@ constexpr int FOOTER_H = 28;
 constexpr int FOOTER_Y = SCREEN_H - FOOTER_H;
 constexpr int DIVIDER_Y = FOOTER_Y - 4;
 
-void drawDroplet(int cx, int cy, int h, uint16_t col) {
-  int r = h / 3;
-  int circleCy = cy + h / 4;
-  tft.fillCircle(cx, circleCy, r, col);
-  int topY = cy - h / 2;
-  int baseY = circleCy - r + 2;
-  tft.fillTriangle(cx, topY, cx - r, baseY, cx + r, baseY, col);
-  tft.fillCircle(cx - r / 3, circleCy - r / 3, r / 6, COL_SUBTITLE);
+// Stylised fuel-pump silhouette: body + inset display + base plate + hose.
+// Centered on (cx, cy), overall height ~h. The hose extends slightly to the
+// right of the body — the icon is intentionally left-biased so the hose
+// doesn't push the visual centre off.
+void drawLogo(int cx, int cy, int h, uint16_t col) {
+  int w = h * 3 / 5;
+  int armW = h / 3;
+  int bodyLeft = cx - (w + armW) / 2;
+  int bodyTop  = cy - h / 2;
+  int bodyH    = h - 4;
+  int baseY    = bodyTop + bodyH;
+  int baseH    = 4;
+  int bodyCx   = bodyLeft + w / 2;
+  int bodyRight = bodyLeft + w;
+
+  // Body
+  tft.fillRoundRect(bodyLeft, bodyTop, w, bodyH, 3, col);
+
+  // Inset display near the top
+  int dispM = 2;
+  int dispH = h / 4;
+  tft.fillRect(bodyLeft + dispM, bodyTop + dispM, w - 2 * dispM, dispH, COL_BG);
+  // A single bright pixel-row inside the display so it reads as "a screen"
+  tft.drawFastHLine(bodyLeft + dispM + 1, bodyTop + dispM + dispH / 2,
+                    w - 2 * dispM - 2, col);
+
+  // Wider base plate
+  int baseW = w + 6;
+  tft.fillRect(bodyCx - baseW / 2, baseY, baseW, baseH, col);
+
+  // Hose: short arm out of the body, then a vertical hose, then a nozzle tip
+  int armY  = bodyTop + dispM + dispH + 3;
+  int hoseH = h / 2;
+  tft.fillRect(bodyRight, armY, armW, 2, col);
+  tft.fillRect(bodyRight + armW - 2, armY, 2, hoseH, col);
+  tft.fillCircle(bodyRight + armW - 1, armY + hoseH + 1, 2, col);
 }
 
 String displayedName = "";
@@ -260,7 +288,7 @@ int drawNameWrapped(const String& text, int cx, int centerY, int maxW) {
 void drawHero() {
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
-  drawDroplet(cx, 45, 55, COL_LOGO);
+  drawLogo(cx, 45, 55, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
 
   if (displayedName.length() == 0) {
@@ -291,7 +319,7 @@ void drawCenteredStatus(const char* title, uint16_t titleCol,
                         const char* line1, const char* line2) {
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
-  drawDroplet(cx, 45, 55, COL_LOGO);
+  drawLogo(cx, 45, 55, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(titleCol, COL_BG);
   tft.drawString(title, cx, 110, 4);
@@ -447,7 +475,7 @@ void startCaptivePortal() {
   snprintf(ipStr, sizeof(ipStr), "If no page: %s", ip.toString().c_str());
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W/2;
-  drawDroplet(cx, 40, 50, COL_LOGO);
+  drawLogo(cx, 40, 50, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(COL_NAME, COL_BG);
   tft.drawString("Setup Wi-Fi", cx, 88, 4);
@@ -638,7 +666,7 @@ bool fetchTimeString(char* out, size_t outSize) {
 void drawBootIpSplash(const IPAddress& ip) {
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
-  drawDroplet(cx, 40, 50, COL_LOGO);
+  drawLogo(cx, 40, 50, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(COL_NAME, COL_BG);
   tft.drawString("Settings at", cx, 100, 4);
