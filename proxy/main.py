@@ -27,8 +27,8 @@ BATCH_SIZE = 500
 FIRST_REQUEST_WAIT = 120       # seconds a cold request will wait for initial load
 
 _cache: dict[str, Any] = {
-    "stations": [],      # merged, flat records ready for filtering
-    "updated_at": None,
+    "stations": {},      # dict keyed by node_id -> flat record
+    "updated_at": None,  # unix ts of last successful refresh (full or incremental)
     "refreshing": False,
     "last_error": None,
 }
@@ -70,15 +70,24 @@ async def get_access_token(client: httpx.AsyncClient) -> str:
     return token
 
 
-async def fetch_paged(client: httpx.AsyncClient, path: str, token: str, dump_first: bool) -> list[dict]:
+async def fetch_paged(
+    client: httpx.AsyncClient,
+    path: str,
+    token: str,
+    dump_first: bool,
+    extra_params: dict | None = None,
+) -> list[dict]:
     out: list[dict] = []
     batch = 1
     while True:
         if batch > 1:
             await asyncio.sleep(REQUEST_SPACING)
+        params = {"batch-number": batch}
+        if extra_params:
+            params.update(extra_params)
         r = await client.get(
             f"{FUEL_HOST}{path}",
-            params={"batch-number": batch},
+            params=params,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
@@ -111,9 +120,11 @@ def _pluck(d: dict, *keys, default=None):
     return default
 
 
+def _is_closed(raw: dict) -> bool:
+    return bool(raw.get("permanent_closure")) or bool(raw.get("temporary_closure"))
+
+
 def _coerce_station(s: dict) -> dict | None:
-    if s.get("permanent_closure") or s.get("temporary_closure"):
-        return None
     loc = s.get("location") or {}
     if not isinstance(loc, dict):
         return None
@@ -121,18 +132,27 @@ def _coerce_station(s: dict) -> dict | None:
     lon = _pluck(loc, "longitude", "lng", "lon", "Longitude")
     if lat is None or lon is None:
         return None
-    town = _pluck(loc, "town", "locality", "post_town", "city", default="") or ""
     try:
         lat = float(lat)
         lon = float(lon)
     except (TypeError, ValueError):
         return None
+    line1 = str(_pluck(loc, "address_line_1", default="")).strip()
+    line2 = str(_pluck(loc, "address_line_2", default="")).strip()
+    address = ", ".join(p for p in (line1, line2) if p)
     return {
         "node_id": s.get("node_id"),
         "name": (s.get("trading_name") or s.get("brand_name") or "").strip(),
-        "town": str(town).strip(),
+        "brand": (s.get("brand_name") or "").strip(),
+        "town": str(_pluck(loc, "city", "town", "locality", "post_town", default="")).strip().title(),
+        "postcode": str(_pluck(loc, "postcode", default="")).strip().upper(),
+        "address": address.title(),
         "lat": lat,
         "lon": lon,
+        "is_motorway": bool(s.get("is_motorway_service_station")),
+        "is_supermarket": bool(s.get("is_supermarket_service_station")),
+        "e10": None,
+        "b7": None,
     }
 
 
@@ -169,39 +189,72 @@ async def refresh_cache() -> None:
     _cache["refreshing"] = True
     started = time.time()
     try:
-        log.info("Cache refresh starting (proxy=%s)", "on" if FUEL_FINDER_PROXY else "off")
+        is_full = not _cache["stations"] or _cache["updated_at"] is None
+        extra_params: dict | None = None
+        if not is_full:
+            # Subtract a safety margin so we don't miss records whose effective
+            # timestamp is a few seconds before ours (clock skew, API lag).
+            since_ts = int(_cache["updated_at"]) - 300
+            extra_params = {
+                "effective-start-timestamp": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.gmtime(since_ts)
+                )
+            }
+        mode = "full" if is_full else f"incremental since {extra_params['effective-start-timestamp']}"
+        log.info("Cache refresh starting (%s, proxy=%s)", mode, "on" if FUEL_FINDER_PROXY else "off")
+
         async with httpx.AsyncClient(proxy=FUEL_FINDER_PROXY, trust_env=False) as client:
             token = await get_access_token(client)
-            stations_raw = await fetch_paged(client, "/api/v1/pfs", token, dump_first=True)
+            stations_raw = await fetch_paged(
+                client, "/api/v1/pfs", token, dump_first=is_full, extra_params=extra_params
+            )
             await asyncio.sleep(REQUEST_SPACING)
-            prices_raw = await fetch_paged(client, "/api/v1/pfs/fuel-prices", token, dump_first=True)
+            prices_raw = await fetch_paged(
+                client, "/api/v1/pfs/fuel-prices", token, dump_first=is_full, extra_params=extra_params
+            )
 
-        prices_by_node: dict[Any, list[dict]] = {}
+        stations: dict[Any, dict] = {} if is_full else dict(_cache["stations"])
+        for s in stations_raw:
+            nid = s.get("node_id")
+            if not nid:
+                continue
+            if _is_closed(s):
+                stations.pop(nid, None)
+                continue
+            rec = _coerce_station(s)
+            if rec is None:
+                continue
+            existing = stations.get(nid)
+            if existing:
+                # Station record updated but prices come from the other endpoint —
+                # preserve what we already have until the prices merge below.
+                rec["e10"] = existing["e10"]
+                rec["b7"] = existing["b7"]
+            stations[nid] = rec
+
+        prices_updated = 0
         for p in prices_raw:
             nid = p.get("node_id")
             if nid is None:
                 continue
-            prices_by_node[nid] = p.get("fuel_prices") or []
-
-        merged: list[dict] = []
-        with_e10 = 0
-        for s in stations_raw:
-            rec = _coerce_station(s)
-            if rec is None:
+            station = stations.get(nid)
+            if station is None:
                 continue
-            e10, b7 = _coerce_prices(prices_by_node.get(rec["node_id"], []))
-            rec["e10"] = e10
-            rec["b7"] = b7
+            e10, b7 = _coerce_prices(p.get("fuel_prices") or [])
             if e10 is not None:
-                with_e10 += 1
-            merged.append(rec)
+                station["e10"] = e10
+            if b7 is not None:
+                station["b7"] = b7
+            if e10 is not None or b7 is not None:
+                prices_updated += 1
 
-        _cache["stations"] = merged
+        _cache["stations"] = stations
         _cache["updated_at"] = int(time.time())
         _cache["last_error"] = None
+        with_e10 = sum(1 for s in stations.values() if s["e10"] is not None)
         log.info(
-            "Cache refresh complete: %d stations (%d with E10) in %.1fs",
-            len(merged), with_e10, time.time() - started,
+            "Refresh done (%s): total=%d (E10=%d) — this run: stations_touched=%d prices_touched=%d in %.1fs",
+            mode, len(stations), with_e10, len(stations_raw), prices_updated, time.time() - started,
         )
     except Exception as e:
         log.exception("Cache refresh failed")
@@ -281,7 +334,7 @@ async def cheapest(
 
     best = None
     best_dist = None
-    for s in _cache["stations"]:
+    for s in _cache["stations"].values():
         if s["e10"] is None:
             continue
         d = haversine_miles(lat, lon, s["lat"], s["lon"])
@@ -295,7 +348,12 @@ async def cheapest(
 
     return {
         "name": best["name"],
+        "brand": best["brand"],
         "town": best["town"],
+        "postcode": best["postcode"],
+        "address": best["address"],
+        "is_motorway": best["is_motorway"],
+        "is_supermarket": best["is_supermarket"],
         "e10": round(best["e10"], 1),
         "b7": round(best["b7"], 1) if best["b7"] is not None else None,
         "distance": round(best_dist, 1),
