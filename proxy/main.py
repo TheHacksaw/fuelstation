@@ -37,15 +37,23 @@ async def get_access_token(client: httpx.AsyncClient) -> str:
         raise RuntimeError("FUEL_FINDER_CLIENT_ID / FUEL_FINDER_CLIENT_SECRET not set")
     r = await client.post(
         f"{FUEL_HOST}/api/v1/oauth/generate_access_token",
-        json={
+        data={
             "grant_type": "client_credentials",
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
+            "scope": "fuelfinder.read",
         },
+        headers={"Accept": "application/json"},
         timeout=30.0,
     )
     r.raise_for_status()
-    return r.json()["data"]["access_token"]
+    body = r.json()
+    if isinstance(body, dict) and isinstance(body.get("data"), dict):
+        body = body["data"]
+    token = body.get("access_token")
+    if not token:
+        raise RuntimeError(f"No access_token in OAuth response: {body}")
+    return token
 
 
 async def fetch_paged(client: httpx.AsyncClient, path: str, token: str, dump_first: bool) -> list[dict]:
