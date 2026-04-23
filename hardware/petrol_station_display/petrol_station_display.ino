@@ -379,10 +379,12 @@ int drawDirectionsQRAt(double lat, double lon, int blockX, int blockY) {
 // Left-aligned station name, wrapped onto a second line on the last space
 // that still fits line 1. Caller is expected to have set the text colour;
 // this also sets the datum. Returns the line count (1 or 2).
-int drawNameLeftWrapped(const String& text, int x, int topY, int maxW) {
+int drawNameLeftWrapped(const String& text, int x, int topY, int maxW, uint8_t font) {
   tft.setTextDatum(TL_DATUM);
-  if (tft.textWidth(text.c_str(), 4) <= maxW) {
-    tft.drawString(text.c_str(), x, topY, 4);
+  const int lineH = (font == 2) ? 18 : 30;
+
+  if (tft.textWidth(text.c_str(), font) <= maxW) {
+    tft.drawString(text.c_str(), x, topY, font);
     return 1;
   }
 
@@ -390,7 +392,7 @@ int drawNameLeftWrapped(const String& text, int x, int topY, int maxW) {
   for (int i = (int)text.length() - 1; i > 0; i--) {
     if (text.charAt(i) == ' ') {
       String first = text.substring(0, i);
-      if (tft.textWidth(first.c_str(), 4) <= maxW) {
+      if (tft.textWidth(first.c_str(), font) <= maxW) {
         splitIdx = i;
         break;
       }
@@ -399,24 +401,24 @@ int drawNameLeftWrapped(const String& text, int x, int topY, int maxW) {
 
   if (splitIdx < 0) {
     String trimmed = text;
-    while (tft.textWidth((trimmed + "...").c_str(), 4) > maxW && trimmed.length() > 4) {
+    while (tft.textWidth((trimmed + "...").c_str(), font) > maxW && trimmed.length() > 4) {
       trimmed.remove(trimmed.length() - 1);
     }
     trimmed += "...";
-    tft.drawString(trimmed.c_str(), x, topY, 4);
+    tft.drawString(trimmed.c_str(), x, topY, font);
     return 1;
   }
 
   String line1 = text.substring(0, splitIdx);
   String line2 = text.substring(splitIdx + 1);
-  if (tft.textWidth(line2.c_str(), 4) > maxW) {
-    while (tft.textWidth((line2 + "...").c_str(), 4) > maxW && line2.length() > 4) {
+  if (tft.textWidth(line2.c_str(), font) > maxW) {
+    while (tft.textWidth((line2 + "...").c_str(), font) > maxW && line2.length() > 4) {
       line2.remove(line2.length() - 1);
     }
     line2 += "...";
   }
-  tft.drawString(line1.c_str(), x, topY, 4);
-  tft.drawString(line2.c_str(), x, topY + 30, 4);
+  tft.drawString(line1.c_str(), x, topY, font);
+  tft.drawString(line2.c_str(), x, topY + lineH, font);
   return 2;
 }
 
@@ -424,46 +426,56 @@ void drawHero() {
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
 
-  // Logo across the top, centered.
+  // Bottom row: QR on the left, name + subtitle on the right. Anchored to
+  // the divider so the logo above can claim whatever's left.
+  int qrX = 6;
+  int qrSizeGuess = 80;                // version 5 @ 2px/module + margin
+  int qrY = DIVIDER_Y - qrSizeGuess - 4;
+  int qrWidth = drawDirectionsQRAt(displayedLat, displayedLon, qrX, qrY);
+  int bottomRowTop = (qrWidth > 0) ? qrY : (DIVIDER_Y - 50);
+  int bottomRowBottom = DIVIDER_Y - 4;
+
+  // Logo above the bottom row, centered in whatever vertical space is left.
+  int logoZoneTop = 4;
+  int logoZoneBottom = bottomRowTop - 6;
+  int logoZoneCy = (logoZoneTop + logoZoneBottom) / 2;
+
   const BrandLogo* logo = lookupBrandLogo(displayedBrandSlug);
-  int logoBottomY;
   if (logo != nullptr) {
     int lx = cx - logo->width / 2;
-    int ly = 6;
+    int ly = logoZoneCy - logo->height / 2;
+    if (ly < logoZoneTop) ly = logoZoneTop;
     // Converter writes RGB565 MSB-first in each uint16_t; ESP32 is little-
     // endian, so without this toggle the panel reads each pixel's bytes
     // reversed and colours come out wrong.
     tft.setSwapBytes(true);
     tft.pushImage(lx, ly, logo->width, logo->height, logo->data);
     tft.setSwapBytes(false);
-    logoBottomY = ly + logo->height;
   } else {
-    drawLogo(cx, 38, 55, COL_LOGO);
-    logoBottomY = 66;
+    int pumpH = logoZoneBottom - logoZoneTop - 4;
+    if (pumpH > 110) pumpH = 110;
+    drawLogo(cx, logoZoneCy, pumpH, COL_LOGO);
   }
 
+  // Text — either the "waiting" placeholder or the station name + subtitle.
+  int textX = (qrWidth > 0) ? (qrX + qrWidth + 10) : 12;
+  int textMaxW = SCREEN_W - textX - 8;
+
   if (displayedName.length() == 0) {
-    tft.setTextDatum(MC_DATUM);
+    tft.setTextDatum(TL_DATUM);
     tft.setTextColor(COL_NAME, COL_BG);
-    tft.drawString("Finding cheapest fuel...", cx, logoBottomY + 40, 4);
+    tft.drawString("Finding cheapest fuel...", textX, bottomRowTop + 20, 2);
     tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
     return;
   }
 
-  // Below the logo: QR on the left, text on the right (left-aligned).
-  int rowY = logoBottomY + 10;
-  int qrWidth = drawDirectionsQRAt(displayedLat, displayedLon, 8, rowY);
-
-  int textX = (qrWidth > 0) ? (8 + qrWidth + 10) : 12;
-  int textMaxW = SCREEN_W - textX - 8;
-
   tft.setTextColor(COL_NAME, COL_BG);
-  int lines = drawNameLeftWrapped(displayedName, textX, rowY, textMaxW);
+  int lines = drawNameLeftWrapped(displayedName, textX, bottomRowTop + 4, textMaxW, 2);
 
   tft.setTextColor(COL_SUBTITLE, COL_BG);
-  int subY = rowY + (lines == 2 ? 64 : 32);
   tft.setTextDatum(TL_DATUM);
-  tft.drawString(displayedSubtitle.c_str(), textX, subY, 4);
+  int subY = bottomRowBottom - 20;
+  tft.drawString(displayedSubtitle.c_str(), textX, subY, 2);
 
   tft.drawFastHLine(20, DIVIDER_Y, SCREEN_W - 40, COL_DIVIDER);
 }
