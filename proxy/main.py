@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from typing import Any
@@ -124,6 +125,48 @@ def _is_closed(raw: dict) -> bool:
     return bool(raw.get("permanent_closure")) or bool(raw.get("temporary_closure"))
 
 
+# Canonical brand slugs. brand_name is free text in the API (1,398 unique
+# strings as of April 2026 — everything from "SHELL" to "Shell Corby" to
+# "lowercase esso" to independents like "Smiths Greenhill Garage Ltd").
+# More specific patterns come first; first regex match wins. Patterns use
+# word boundaries where needed so e.g. "jet" doesn't match random substrings.
+_BRAND_SLUGGERS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"\bshell\s+harvest", re.I),  "shell_harvest"),
+    (re.compile(r"\bbp\s+harvest",    re.I),  "bp_harvest"),
+    (re.compile(r"\btotal\s+harvest", re.I),  "total_harvest"),
+    (re.compile(r"\bharvest\s+energy", re.I), "harvest"),
+    (re.compile(r"\beg\b.*\bmove",    re.I),  "eg"),
+    (re.compile(r"\bwelcome\s+break", re.I),  "welcome_break"),
+    (re.compile(r"\bcircle\s*k",      re.I),  "circlek"),
+    (re.compile(r"\basda\s+express",  re.I),  "asda_express"),
+    (re.compile(r"\btotal(\s|$|energies)", re.I), "total"),
+    (re.compile(r"\bshell\b",         re.I),  "shell"),
+    (re.compile(r"\bbp\b",            re.I),  "bp"),
+    (re.compile(r"\besso\b",          re.I),  "esso"),
+    (re.compile(r"\btesco\b",         re.I),  "tesco"),
+    (re.compile(r"\bmorrisons?\b",    re.I),  "morrisons"),
+    (re.compile(r"\basda\b",          re.I),  "asda"),
+    (re.compile(r"\bsainsbury",       re.I),  "sainsburys"),
+    (re.compile(r"\btexaco\b",        re.I),  "texaco"),
+    (re.compile(r"\bapplegreen\b",    re.I),  "applegreen"),
+    (re.compile(r"\bvalero\b",        re.I),  "valero"),
+    (re.compile(r"\bgulf\b",          re.I),  "gulf"),
+    (re.compile(r"\bmurco\b",         re.I),  "murco"),
+    (re.compile(r"\bmaxol\b",         re.I),  "maxol"),
+    (re.compile(r"\bessar\b",         re.I),  "essar"),
+    (re.compile(r"\bjet\b",           re.I),  "jet"),
+]
+
+
+def slugify_brand(raw: str) -> str:
+    if not raw:
+        return ""
+    for pat, slug in _BRAND_SLUGGERS:
+        if pat.search(raw):
+            return slug
+    return ""
+
+
 def _coerce_station(s: dict) -> dict | None:
     loc = s.get("location") or {}
     if not isinstance(loc, dict):
@@ -140,10 +183,12 @@ def _coerce_station(s: dict) -> dict | None:
     line1 = str(_pluck(loc, "address_line_1", default="")).strip()
     line2 = str(_pluck(loc, "address_line_2", default="")).strip()
     address = ", ".join(p for p in (line1, line2) if p)
+    brand_raw = (s.get("brand_name") or "").strip()
     return {
         "node_id": s.get("node_id"),
         "name": (s.get("trading_name") or s.get("brand_name") or "").strip(),
-        "brand": (s.get("brand_name") or "").strip(),
+        "brand": brand_raw,
+        "brand_slug": slugify_brand(brand_raw) or slugify_brand(s.get("trading_name") or ""),
         "town": str(_pluck(loc, "city", "town", "locality", "post_town", default="")).strip().title(),
         "postcode": str(_pluck(loc, "postcode", default="")).strip().upper(),
         "address": address.title(),
@@ -349,6 +394,7 @@ async def cheapest(
     return {
         "name": best["name"],
         "brand": best["brand"],
+        "brand_slug": best.get("brand_slug", ""),
         "town": best["town"],
         "postcode": best["postcode"],
         "address": best["address"],

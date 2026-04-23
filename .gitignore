@@ -5,3 +5,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Brand logo source images are trademarked; don't commit them
+hardware/logos/*.png

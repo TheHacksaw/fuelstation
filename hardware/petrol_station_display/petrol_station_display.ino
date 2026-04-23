@@ -34,12 +34,15 @@ using fs::FS;  // ESP32 core v3.x needs this before <WebServer.h>
 #include <ArduinoJson.h>
 #include <time.h>
 
+#include "logos.h"
+
 // =============================================================
 // Types
 // =============================================================
 struct CheapestStation {
   String name;
   String brand;
+  String brandSlug;      // canonical slug from proxy: "shell", "bp", "esso", ...
   String town;
   String postcode;
   String address;
@@ -257,6 +260,7 @@ void drawLogo(int cx, int cy, int h, uint16_t col) {
 
 String displayedName = "";
 String displayedSubtitle = "";
+String displayedBrandSlug = "";
 
 // Draw `text` in font 4, wrapping onto two lines on the last space that still
 // fits line 1. Returns 1 or 2 depending on how many lines were drawn.
@@ -305,7 +309,16 @@ int drawNameWrapped(const String& text, int cx, int centerY, int maxW) {
 void drawHero() {
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
-  drawLogo(cx, 45, 55, COL_LOGO);
+
+  const uint16_t* logo = lookupBrandLogo(displayedBrandSlug);
+  if (logo != nullptr) {
+    int lx = cx - BRAND_LOGO_SIZE / 2;
+    int ly = 45 - BRAND_LOGO_SIZE / 2;
+    tft.pushImage(lx, ly, BRAND_LOGO_SIZE, BRAND_LOGO_SIZE, logo);
+  } else {
+    drawLogo(cx, 45, 55, COL_LOGO);
+  }
+
   tft.setTextDatum(MC_DATUM);
 
   if (displayedName.length() == 0) {
@@ -355,16 +368,18 @@ String savedPostcode()  { return prefs.getString("postcode", ""); }
 int    savedRadius()    { return prefs.getInt("radius_mi", 5); }
 String savedProxyUrl()  { return prefs.getString("proxy_url", PROXY_URL_DEFAULT); }
 
-int    cachedUnleaded() { return prefs.getInt("c_unl", -1); }
-int    cachedDiesel()   { return prefs.getInt("c_dsl", -1); }
-String cachedName()     { return prefs.getString("c_name", ""); }
-String cachedSubtitle() { return prefs.getString("c_sub", ""); }
+int    cachedUnleaded()  { return prefs.getInt("c_unl", -1); }
+int    cachedDiesel()    { return prefs.getInt("c_dsl", -1); }
+String cachedName()      { return prefs.getString("c_name", ""); }
+String cachedSubtitle()  { return prefs.getString("c_sub", ""); }
+String cachedBrandSlug() { return prefs.getString("c_bslug", ""); }
 
-void savePrices(int u, int d, const String& name, const String& subtitle) {
+void savePrices(int u, int d, const String& name, const String& subtitle, const String& brandSlug) {
   prefs.putInt("c_unl", u);
   prefs.putInt("c_dsl", d);
   prefs.putString("c_name", name);
   prefs.putString("c_sub", subtitle);
+  prefs.putString("c_bslug", brandSlug);
 }
 
 // =============================================================
@@ -604,9 +619,10 @@ bool fetchCheapest() {
     return false;
   }
 
-  current.name          = (const char*)(doc["name"]     | "");
-  current.brand         = (const char*)(doc["brand"]    | "");
-  current.town          = (const char*)(doc["town"]     | "");
+  current.name          = (const char*)(doc["name"]       | "");
+  current.brand         = (const char*)(doc["brand"]      | "");
+  current.brandSlug     = (const char*)(doc["brand_slug"] | "");
+  current.town          = (const char*)(doc["town"]       | "");
   current.postcode      = (const char*)(doc["postcode"] | "");
   current.address       = (const char*)(doc["address"]  | "");
   current.isMotorway    = doc["is_motorway"]    | false;
@@ -650,6 +666,7 @@ bool refreshFuelData(bool silent) {
   if (shownName.length() == 0) shownName = "(unnamed)";
   displayedName = shownName;
   displayedSubtitle = buildSubtitle(current);
+  displayedBrandSlug = current.brandSlug;
 
   fuel.setPrices(
     current.priceE10_ppl > 0 ? current.priceE10_ppl : 0,
@@ -657,7 +674,7 @@ bool refreshFuelData(bool silent) {
   );
   fuel.setMode(SegMode::PRICES);
 
-  savePrices(current.priceE10_ppl, current.priceB7_ppl, displayedName, displayedSubtitle);
+  savePrices(current.priceE10_ppl, current.priceB7_ppl, displayedName, displayedSubtitle, displayedBrandSlug);
   drawHero();
 
   Serial.printf("[refresh] ok: %s — %d/%dppl — %.1fmi\n",
@@ -714,6 +731,7 @@ void setup() {
   // Restore cached display from last successful refresh
   displayedName = cachedName();
   displayedSubtitle = cachedSubtitle();
+  displayedBrandSlug = cachedBrandSlug();
   int cu = cachedUnleaded(), cd = cachedDiesel();
   if (cu > 0) fuel.setPrices(cu, cd > 0 ? cd : 0);
   fuel.setMode(SegMode::BLANK);
