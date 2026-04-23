@@ -32,6 +32,7 @@ using fs::FS;  // ESP32 core v3.x needs this before <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
+#include <qrcode.h>   // ricmoo/QRCode — install via Arduino Library Manager
 #include <time.h>
 
 #include "logos.h"
@@ -48,6 +49,8 @@ struct CheapestStation {
   String address;
   bool   isMotorway;
   bool   isSupermarket;
+  double lat;            // station coords for the Google Maps QR
+  double lon;
   int    priceE10_ppl;   // rounded to whole pence
   int    priceB7_ppl;
   double distanceMi;
@@ -270,6 +273,8 @@ void drawLogo(int cx, int cy, int h, uint16_t col) {
 String displayedName = "";
 String displayedSubtitle = "";
 String displayedBrandSlug = "";
+double displayedLat = 0.0;
+double displayedLon = 0.0;
 
 // Draw `text` in font 4, wrapping onto two lines on the last space that still
 // fits line 1. Returns 1 or 2 depending on how many lines were drawn.
@@ -315,13 +320,57 @@ int drawNameWrapped(const String& text, int cx, int centerY, int maxW) {
   return 2;
 }
 
+// Draw a scannable QR for the Google Maps directions URL at the given coords.
+// Sits in the top-right corner so it doesn't fight with the logo. Returns the
+// pixel width of the QR block (including its white border) so drawHero can
+// narrow the logo's available real estate.
+int drawDirectionsQR(double lat, double lon) {
+  if (lat == 0.0 && lon == 0.0) return 0;
+
+  char url[96];
+  snprintf(url, sizeof(url),
+           "https://www.google.com/maps/dir/?api=1&destination=%.5f,%.5f",
+           lat, lon);
+
+  constexpr uint8_t QR_VERSION = 5;  // 37x37 modules; 106 alnum chars @ ECC_L
+  uint8_t buf[qrcode_getBufferSize(QR_VERSION)];
+  QRCode qr;
+  if (qrcode_initText(&qr, buf, QR_VERSION, ECC_LOW, url) != 0) return 0;
+
+  constexpr int MODULE_PX = 2;
+  constexpr int MARGIN_PX = 3;  // white quiet zone around the code
+  int codePx = qr.size * MODULE_PX;
+  int blockPx = codePx + 2 * MARGIN_PX;
+  int blockX = SCREEN_W - blockPx - 6;
+  int blockY = 4;
+
+  // White background (quiet zone). 0xFFFF is all-bits-on so it's white
+  // regardless of the panel's RGB/BGR ordering.
+  tft.fillRect(blockX, blockY, blockPx, blockPx, 0xFFFF);
+
+  for (uint8_t y = 0; y < qr.size; y++) {
+    for (uint8_t x = 0; x < qr.size; x++) {
+      if (qrcode_getModule(&qr, x, y)) {
+        tft.fillRect(blockX + MARGIN_PX + x * MODULE_PX,
+                     blockY + MARGIN_PX + y * MODULE_PX,
+                     MODULE_PX, MODULE_PX, 0x0000);
+      }
+    }
+  }
+  return blockPx;
+}
+
 void drawHero() {
   tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
 
+  // QR first so the logo can be placed in whatever horizontal space is left.
+  int qrWidth = drawDirectionsQR(displayedLat, displayedLon);
+  int logoCx = qrWidth > 0 ? (SCREEN_W - qrWidth - 12) / 2 : cx;
+
   const BrandLogo* logo = lookupBrandLogo(displayedBrandSlug);
   if (logo != nullptr) {
-    int lx = cx - logo->width / 2;
+    int lx = logoCx - logo->width / 2;
     int ly = 45 - logo->height / 2;
     // Converter writes RGB565 values MSB-first in each uint16_t. The ESP32 is
     // little-endian, so without this toggle the display reads each pixel's
@@ -330,7 +379,7 @@ void drawHero() {
     tft.pushImage(lx, ly, logo->width, logo->height, logo->data);
     tft.setSwapBytes(false);
   } else {
-    drawLogo(cx, 45, 55, COL_LOGO);
+    drawLogo(logoCx, 45, 55, COL_LOGO);
   }
 
   tft.setTextDatum(MC_DATUM);
@@ -387,13 +436,18 @@ int    cachedDiesel()    { return prefs.getInt("c_dsl", -1); }
 String cachedName()      { return prefs.getString("c_name", ""); }
 String cachedSubtitle()  { return prefs.getString("c_sub", ""); }
 String cachedBrandSlug() { return prefs.getString("c_bslug", ""); }
+double cachedLat()       { return prefs.getDouble("c_lat", 0.0); }
+double cachedLon()       { return prefs.getDouble("c_lon", 0.0); }
 
-void savePrices(int u, int d, const String& name, const String& subtitle, const String& brandSlug) {
+void savePrices(int u, int d, const String& name, const String& subtitle,
+                const String& brandSlug, double lat, double lon) {
   prefs.putInt("c_unl", u);
   prefs.putInt("c_dsl", d);
   prefs.putString("c_name", name);
   prefs.putString("c_sub", subtitle);
   prefs.putString("c_bslug", brandSlug);
+  prefs.putDouble("c_lat", lat);
+  prefs.putDouble("c_lon", lon);
 }
 
 // =============================================================
@@ -641,6 +695,8 @@ bool fetchCheapest() {
   current.address       = (const char*)(doc["address"]  | "");
   current.isMotorway    = doc["is_motorway"]    | false;
   current.isSupermarket = doc["is_supermarket"] | false;
+  current.lat           = doc["lat"] | 0.0;
+  current.lon           = doc["lon"] | 0.0;
   double e10 = doc["e10"] | 0.0;
   double b7  = doc["b7"]  | 0.0;
   current.priceE10_ppl = (e10 > 0.0) ? (int)round(e10) : -1;
@@ -681,6 +737,8 @@ bool refreshFuelData(bool silent) {
   displayedName = shownName;
   displayedSubtitle = buildSubtitle(current);
   displayedBrandSlug = current.brandSlug;
+  displayedLat = current.lat;
+  displayedLon = current.lon;
 
   fuel.setPrices(
     current.priceE10_ppl > 0 ? current.priceE10_ppl : 0,
@@ -688,7 +746,8 @@ bool refreshFuelData(bool silent) {
   );
   fuel.setMode(SegMode::PRICES);
 
-  savePrices(current.priceE10_ppl, current.priceB7_ppl, displayedName, displayedSubtitle, displayedBrandSlug);
+  savePrices(current.priceE10_ppl, current.priceB7_ppl, displayedName, displayedSubtitle,
+             displayedBrandSlug, displayedLat, displayedLon);
   drawHero();
 
   Serial.printf("[refresh] ok: %s — %d/%dppl — %.1fmi\n",
@@ -746,6 +805,8 @@ void setup() {
   displayedName = cachedName();
   displayedSubtitle = cachedSubtitle();
   displayedBrandSlug = cachedBrandSlug();
+  displayedLat = cachedLat();
+  displayedLon = cachedLon();
   int cu = cachedUnleaded(), cd = cachedDiesel();
   if (cu > 0) fuel.setPrices(cu, cd > 0 ? cd : 0);
   fuel.setMode(SegMode::BLANK);

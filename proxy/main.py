@@ -400,6 +400,8 @@ async def cheapest(
         "address": best["address"],
         "is_motorway": best["is_motorway"],
         "is_supermarket": best["is_supermarket"],
+        "lat": round(best["lat"], 6),
+        "lon": round(best["lon"], 6),
         "e10": round(best["e10"], 1),
         "b7": round(best["b7"], 1) if best["b7"] is not None else None,
         "distance": round(best_dist, 1),
