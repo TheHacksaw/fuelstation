@@ -26,6 +26,8 @@
 #include <TFT_eSPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <FS.h>
+using fs::FS;  // ESP32 core v3.x needs this before <WebServer.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
