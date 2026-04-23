@@ -69,9 +69,10 @@ struct NearbyStation {
 // =============================================================
 
 // Fuel Finder OAuth credentials (from developer.fuel-finder.service.gov.uk)
-// NOTE: stored in firmware. Anyone with USB access can extract them.
-const char* FUEL_FINDER_CLIENT_ID     = "fCmHTPxSUzvlYVgvGkbuplzZ01HN842U";
-const char* FUEL_FINDER_CLIENT_SECRET = "40njh0w6EnbK7C2wXEjpwphGc4E8Tl0m3o4gNCZhF9bdZX2NK5SychA9EoUHp9Ab";
+// Once the proxy is live these will be removed entirely — ESP32 hits the
+// proxy, which holds the credentials server-side.
+const char* FUEL_FINDER_CLIENT_ID     = "REPLACE_ME";
+const char* FUEL_FINDER_CLIENT_SECRET = "REPLACE_ME";
 
 // API endpoints
 const char* FUEL_FINDER_BASE = "https://www.fuel-finder.service.gov.uk";
