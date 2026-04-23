@@ -32,6 +32,9 @@ _cache: dict[str, Any] = {
 
 # --- Fuel Finder client ---------------------------------------------------
 
+UA = "fuelstation-proxy/0.1 (+https://github.com/TheHacksaw/fuelstation)"
+
+
 async def get_access_token(client: httpx.AsyncClient) -> str:
     if not CLIENT_ID or not CLIENT_SECRET:
         raise RuntimeError("FUEL_FINDER_CLIENT_ID / FUEL_FINDER_CLIENT_SECRET not set")
@@ -43,10 +46,17 @@ async def get_access_token(client: httpx.AsyncClient) -> str:
             "client_secret": CLIENT_SECRET,
             "scope": "fuelfinder.read",
         },
-        headers={"Accept": "application/json"},
+        headers={"Accept": "application/json", "User-Agent": UA},
         timeout=30.0,
     )
-    r.raise_for_status()
+    if r.status_code >= 400:
+        log.error(
+            "OAuth %d response headers=%s body=%s",
+            r.status_code,
+            dict(r.headers),
+            r.text[:1000],
+        )
+        r.raise_for_status()
     body = r.json()
     if isinstance(body, dict) and isinstance(body.get("data"), dict):
         body = body["data"]
@@ -65,7 +75,11 @@ async def fetch_paged(client: httpx.AsyncClient, path: str, token: str, dump_fir
         r = await client.get(
             f"{FUEL_HOST}{path}",
             params={"batch-number": batch},
-            headers={"Authorization": f"Bearer {token}"},
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "User-Agent": UA,
+            },
             timeout=60.0,
         )
         r.raise_for_status()
