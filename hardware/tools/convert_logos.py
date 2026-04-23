@@ -40,7 +40,11 @@ TFT_BG_RGB = (16, 20, 16)
 
 
 def rgb565(r: int, g: int, b: int) -> int:
-    return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+    # The TFT panel this project uses is wired in BGR colour order, so R and
+    # B come out swapped at render time (yellow text reads as cyan, orange as
+    # blue). Pre-swap R and B here so the cancellation lands on the display
+    # as the original colours.
+    return ((b & 0xF8) << 8) | ((g & 0xFC) << 3) | (r >> 3)
 
 
 def convert_image(path: Path, max_w: int, max_h: int) -> tuple[list[int], int, int]:
