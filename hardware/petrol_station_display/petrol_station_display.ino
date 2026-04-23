@@ -258,7 +258,7 @@ int drawNameWrapped(const String& text, int cx, int centerY, int maxW) {
 }
 
 void drawHero() {
-  tft.fillRect(0, 0, SCREEN_W, DIVIDER_Y, COL_BG);
+  tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
   drawDroplet(cx, 45, 55, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
@@ -289,7 +289,7 @@ void drawFooter(const char* timeStr) {
 
 void drawCenteredStatus(const char* title, uint16_t titleCol,
                         const char* line1, const char* line2) {
-  tft.fillRect(0, 0, SCREEN_W, DIVIDER_Y, COL_BG);
+  tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
   drawDroplet(cx, 45, 55, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
@@ -445,7 +445,7 @@ void startCaptivePortal() {
 
   char ipStr[32];
   snprintf(ipStr, sizeof(ipStr), "If no page: %s", ip.toString().c_str());
-  tft.fillRect(0, 0, SCREEN_W, DIVIDER_Y, COL_BG);
+  tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W/2;
   drawDroplet(cx, 40, 50, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
@@ -576,12 +576,11 @@ bool fetchCheapest() {
   return true;
 }
 
-// Combine "Dover • 3.8 mi" style subtitle
 String buildSubtitle(const CheapestStation& s) {
   String out = s.town;
   if (s.distanceMi > 0) {
     char buf[24];
-    snprintf(buf, sizeof(buf), " \xE2\x80\xA2 %.1f mi", s.distanceMi);
+    snprintf(buf, sizeof(buf), " - %.1f mi", s.distanceMi);
     out += buf;
   }
   return out;
@@ -637,7 +636,7 @@ bool fetchTimeString(char* out, size_t outSize) {
 // Splash shown for a few seconds after WiFi connects, so the user can see the
 // LAN IP and open the settings page.
 void drawBootIpSplash(const IPAddress& ip) {
-  tft.fillRect(0, 0, SCREEN_W, DIVIDER_Y, COL_BG);
+  tft.fillRect(0, 0, SCREEN_W, FOOTER_Y, COL_BG);
   int cx = SCREEN_W / 2;
   drawDroplet(cx, 40, 50, COL_LOGO);
   tft.setTextDatum(MC_DATUM);
