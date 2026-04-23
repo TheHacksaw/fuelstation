@@ -58,7 +58,7 @@ struct CheapestStation {
 // CONFIG
 // =============================================================
 const char* PORTAL_SSID = "PetrolStation-Setup";
-const char* PROXY_URL_DEFAULT = "http://79.72.89.239:8080";
+const char* PROXY_URL_DEFAULT = "http://144.21.57.147:8080";
 
 const char* NTP_SERVER = "time.google.com";
 const char* TZ_UK = "GMT0BST,M3.5.0/1,M10.5.0/2";
@@ -174,6 +174,19 @@ private:
     out[2] = encodeDigit(d2);
   }
 
+  static inline void shiftAndLatch(const uint8_t out[6]) {
+    digitalWrite(PIN_SEG_LOAD, LOW);
+    if (REVERSE_DIGIT_SHIFT_ORDER) {
+      for (int i=0; i<6; i++) shiftByte(out[i]);
+    } else {
+      for (int i=5; i>=0; i--) shiftByte(out[i]);
+    }
+    delayMicroseconds(2);
+    digitalWrite(PIN_SEG_LOAD, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(PIN_SEG_LOAD, LOW);
+  }
+
   void render() {
     uint8_t patterns[6];
     switch (_mode) {
@@ -196,16 +209,12 @@ private:
     uint8_t out[6];
     for (int i=0; i<6; i++) out[i] = ~patterns[i];
 
-    digitalWrite(PIN_SEG_LOAD, LOW);
-    if (REVERSE_DIGIT_SHIFT_ORDER) {
-      for (int i=0; i<6; i++) shiftByte(out[i]);
-    } else {
-      for (int i=5; i>=0; i--) shiftByte(out[i]);
-    }
-    delayMicroseconds(2);
-    digitalWrite(PIN_SEG_LOAD, HIGH);
-    delayMicroseconds(5);
-    digitalWrite(PIN_SEG_LOAD, LOW);
+    // Shift twice with a brief gap. If the first pass dropped or gained a
+    // clock edge (ringing / WiFi RF), the second reloads the chain with the
+    // correct state before the user notices.
+    shiftAndLatch(out);
+    delayMicroseconds(200);
+    shiftAndLatch(out);
   }
 };
 
